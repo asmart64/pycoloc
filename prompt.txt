@@ -1,0 +1,1 @@
+build a python app which enables the user to estimate the colocalization of two channels giving the MAnder's parameters. The app should allow for simple ROI selection. It must show histograms of intensities and illustrate the working of Costes algorithm to set thresholds

@@ -1,0 +1,1340 @@
+#!/usr/bin/env python3
+"""
+Colocalization Analyzer
+=======================
+Estimates Mander's Overlap Coefficients (M1, M2, tM1, tM2) for two-channel
+fluorescence images, using the Costes automatic thresholding algorithm.
+
+Features
+--------
+- Load two single-channel images (TIFF, PNG, JPEG, BMP; 8-bit or 16-bit).
+- Generate synthetic demo image pairs with multiple colocalization regimes
+    for testing the analysis workflow.
+- Draw a rectangular ROI on the Channel-1 display; analysis is restricted to
+  that region (or the full image when no ROI is defined).
+- Costes algorithm: iterates the threshold pair (T1, T2) down the linear
+  regression line of Ch2 vs Ch1 until Pearson's r drops to ≤ 0.
+- Intensity histograms with threshold markers.
+- Scatter plot coloured by colocalization status and Pearson's-r-vs-threshold
+  curve that illustrates how the Costes threshold is found.
+- Manual threshold input boxes for live recalculation of the Manders coefficients.
+
+Dependencies
+------------
+    pip install numpy scipy matplotlib tifffile Pillow
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import Rectangle
+from matplotlib.widgets import RectangleSelector
+
+from scipy import stats
+
+# ── optional image-loading libraries ──────────────────────────────────────────
+try:
+    import tifffile
+    _HAS_TIFFFILE = True
+except ImportError:
+    _HAS_TIFFFILE = False
+
+try:
+    from PIL import Image
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+# ── custom colormaps: black → colour ──────────────────────────────────────────
+def _linear_cmap(r, g, b, name):
+    cdict = {
+        "red":   [(0.0, 0.0, 0.0), (1.0, r, r)],
+        "green": [(0.0, 0.0, 0.0), (1.0, g, g)],
+        "blue":  [(0.0, 0.0, 0.0), (1.0, b, b)],
+    }
+    return mcolors.LinearSegmentedColormap(name, cdict)
+
+_CYAN    = _linear_cmap(0, 1, 1, "cyan_cm")
+_MAGENTA = _linear_cmap(1, 0, 1, "magenta_cm")
+
+# ── colour palette ─────────────────────────────────────────────────────────────
+BG     = "#1e1e2e"
+BG2    = "#2b2b3b"
+FG     = "#cdd6f4"
+YELLOW = "#f9e2af"
+CYAN   = "#89dceb"
+MAGENTA = "#f38ba8"
+GREEN  = "#a6e3a1"
+GRAY   = "#6c7086"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class ColocalizationApp:
+    """Main application window."""
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Colocalization Analyzer — Mander's Coefficients")
+        self.root.configure(bg=BG2)
+        # MacBook-friendly default size while keeping enough room for plots.
+        self.root.geometry("1320x820")
+        self.root.minsize(1100, 700)
+
+        # application state
+        self.ch1: np.ndarray | None = None
+        self.ch2: np.ndarray | None = None
+        self.roi: tuple | None = None          # (x1, y1, x2, y2) pixel coords
+        self._roi_active = True
+        self._demo_presets = {
+            "High overlap": "Strongly shared puncta with mild independent signal.",
+            "Partial overlap": "Mixed shared, offset, and channel-specific structures.",
+            "Offset structures": "Similar objects with systematic spatial offsets.",
+            "Low overlap": "Mostly independent objects with weak diffuse correlation.",
+            "Randomization demo": "Aligned mesoscale structure: high observed r, low shuffled r.",
+            "Randomization control": "Mostly independent channels: shuffled r similar to observed r.",
+        }
+        self._last_costes_slope: float | None = None
+        self._last_costes_intercept: float | None = None
+        self._last_costes_curve_t = np.array([])
+        self._last_costes_curve_r = np.array([])
+        self._roi_overlay_after_id = None
+
+        self._build_ui()
+
+    # ── UI construction ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._apply_theme()
+
+        # ── toolbar ────────────────────────────────────────────────────────────
+        tb = ttk.Frame(self.root, padding=6)
+        tb.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(tb, text="Load Channel 1",  command=self.load_ch1).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tb, text="Load Channel 2",  command=self.load_ch2).pack(side=tk.LEFT, padx=3)
+        self._demo_preset_var = tk.StringVar(value="Partial overlap")
+        self._demo_preset_box = ttk.Combobox(
+            tb,
+            textvariable=self._demo_preset_var,
+            values=list(self._demo_presets.keys()),
+            state="readonly",
+            width=18,
+        )
+        self._demo_preset_box.pack(side=tk.LEFT, padx=(12, 3))
+        ttk.Button(tb, text="Load Demo Set", command=self.load_demo_set).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tb, text="Export Demo TIFFs", command=self.export_demo_set).pack(side=tk.LEFT, padx=3)
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self._roi_btn = ttk.Button(
+            tb,
+            text="Cancel ROI" if self._roi_active else "Draw ROI",
+            command=self.toggle_roi,
+        )
+        self._roi_btn.pack(side=tk.LEFT, padx=3)
+        ttk.Button(tb, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=3)
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(tb, text="Run Costes + Analyze", command=self.run_analysis).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tb, text="Quit", command=self.root.destroy).pack(side=tk.LEFT, padx=3)
+
+        self._status = tk.StringVar(value="Load two single-channel images to begin.")
+        ttk.Label(tb, textvariable=self._status, foreground=GRAY).pack(side=tk.RIGHT, padx=10)
+
+        # ── main paned layout ──────────────────────────────────────────────────
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        left = ttk.LabelFrame(paned, text="Images  (draw ROI on left image)")
+        paned.add(left, weight=2)
+        self._build_image_panel(left)
+
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+        self._build_right_panel(right)
+
+    def _apply_theme(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".",       background=BG2, foreground=FG)
+        style.configure("TFrame",  background=BG2)
+        style.configure("TLabel",  background=BG2, foreground=FG)
+        style.configure("TButton", background=BG,  foreground=FG, relief=tk.FLAT, padding=4)
+        style.map("TButton", background=[("active", "#313244")])
+        style.configure("TLabelframe",       background=BG2, foreground=FG)
+        style.configure("TLabelframe.Label", background=BG2, foreground=CYAN)
+        style.configure("TNotebook",         background=BG2)
+        style.configure("TNotebook.Tab",     background=BG,  foreground=FG, padding=[8, 3])
+        style.map("TNotebook.Tab",           background=[("selected", BG2)], foreground=[("selected", YELLOW)])
+        style.configure("TScale",            background=BG2)
+        style.configure("TSeparator",        background=GRAY)
+
+    def _build_image_panel(self, parent):
+        fig, axes = plt.subplots(1, 2, figsize=(7, 4), facecolor=BG2)
+        self._img_fig   = fig
+        self._img_axes  = axes
+        for ax in axes:
+            ax.set_facecolor("#111122")
+            ax.tick_params(colors=FG)
+        axes[0].set_title("Channel 1", color=CYAN,    fontsize=10)
+        axes[1].set_title("Channel 2", color=MAGENTA, fontsize=10)
+        fig.tight_layout(pad=1.2)
+
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._img_canvas = canvas
+
+        # ROI selector on the Channel-1 axis
+        rs_kwargs = dict(
+            useblit=True, button=[1],
+            minspanx=5, minspany=5,
+            spancoords="data", interactive=True,
+        )
+        try:
+            rs_kwargs["props"] = dict(edgecolor=YELLOW, facecolor=YELLOW, alpha=0.15)
+            self._roi_sel = RectangleSelector(axes[0], self._on_roi_select, **rs_kwargs)
+        except TypeError:
+            # older matplotlib – no 'props' kwarg
+            rs_kwargs.pop("props", None)
+            self._roi_sel = RectangleSelector(axes[0], self._on_roi_select, **rs_kwargs)
+        self._roi_sel.set_active(self._roi_active)
+
+    def _build_right_panel(self, parent):
+        nb = ttk.Notebook(parent)
+        nb.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1 – Intensity Histograms
+        t_hist = ttk.Frame(nb)
+        nb.add(t_hist, text="Intensity Histograms")
+        hist_fig, hist_axes = plt.subplots(2, 1, figsize=(6, 5),
+                                           facecolor=BG, tight_layout=True)
+        self._hist_fig   = hist_fig
+        self._hist_axes  = hist_axes
+        self._hist_t1_line = None
+        self._hist_t2_line = None
+        self._hist_canvas = FigureCanvasTkAgg(hist_fig, t_hist)
+        self._hist_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Tab 2 – Costes thresholding
+        t_costes = ttk.Frame(nb)
+        nb.add(t_costes, text="Costes Thresholding")
+        costes_fig, costes_axes = plt.subplots(1, 2, figsize=(8, 4),
+                                               facecolor=BG, tight_layout=True)
+        self._costes_fig    = costes_fig
+        self._costes_axes   = costes_axes
+        self._costes_canvas = FigureCanvasTkAgg(costes_fig, t_costes)
+        self._costes_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Tab 3 – Results
+        t_res = ttk.Frame(nb)
+        nb.add(t_res, text="Results")
+        self._build_results_tab(t_res)
+
+        # Manual threshold controls (entry-only for responsiveness)
+        sf = ttk.LabelFrame(parent, text="Manual Threshold Input")
+        sf.pack(fill=tk.X, padx=4, pady=4)
+        self._build_sliders(sf)
+
+    def _build_results_tab(self, parent):
+        outer = ttk.Frame(parent, padding=14)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # formula reference
+        ref = (
+            "M1  = Σ ch1ᵢ [ch2ᵢ > T₂] / Σ ch1ᵢ\n"
+            "M2  = Σ ch2ᵢ [ch1ᵢ > T₁] / Σ ch2ᵢ\n"
+            "tM1 = Σ ch1ᵢ [ch1ᵢ > T₁ ∧ ch2ᵢ > T₂] / Σ ch1ᵢ\n"
+            "tM2 = Σ ch2ᵢ [ch1ᵢ > T₁ ∧ ch2ᵢ > T₂] / Σ ch2ᵢ"
+        )
+        ttk.Label(outer, text=ref, foreground=GRAY,
+                  font=("Courier New", 9), justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Separator(outer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+
+        grid = ttk.Frame(outer)
+        grid.pack(fill=tk.BOTH, expand=True)
+
+        rows = [
+            ("Costes Threshold  T₁ (Ch1)",              "costes_t1"),
+            ("Costes Threshold  T₂ (Ch2)",              "costes_t2"),
+            None,
+            ("Mander's M1   — Ch1 fraction colocalizing with Ch2", "m1"),
+            ("Mander's M2   — Ch2 fraction colocalizing with Ch1", "m2"),
+            None,
+            ("Thresholded  tM1  (both channels above Costes T)",   "tm1"),
+            ("Thresholded  tM2  (both channels above Costes T)",   "tm2"),
+            None,
+            ("Pearson's r  (pixels above both thresholds)",        "pearson"),
+            ("Overlap coefficient R  (Manders 1993)",              "overlap"),
+            ("k1   = Σ(ch1·ch2) / Σ(ch1²)",                       "k1"),
+            ("k2   = Σ(ch1·ch2) / Σ(ch2²)",                       "k2"),
+            None,
+            ("Costes randomization r  (all ROI pixels)",          "costes_r_obs"),
+            ("Randomized r mean ± SD",                             "costes_r_rand"),
+            ("Costes randomization significance",                  "costes_sig"),
+            ("Monte Carlo p  (random r ≥ observed r)",            "costes_p"),
+        ]
+
+        self._rv = {}
+        row_idx = 0
+        for item in rows:
+            if item is None:
+                ttk.Separator(grid, orient=tk.HORIZONTAL).grid(
+                    row=row_idx, column=0, columnspan=2, sticky=tk.EW, pady=5)
+                row_idx += 1
+                continue
+            label, key = item
+            ttk.Label(grid, text=label + ":", anchor=tk.W).grid(
+                row=row_idx, column=0, sticky=tk.W, pady=2)
+            var = tk.StringVar(value="—")
+            self._rv[key] = var
+            ttk.Label(grid, textvariable=var,
+                      font=("Courier New", 11, "bold"),
+                      foreground=GREEN).grid(row=row_idx, column=1, sticky=tk.W, padx=12)
+            row_idx += 1
+
+        grid.columnconfigure(0, weight=1)
+
+    def _build_sliders(self, parent):
+        self._t1_max = 255.0
+        self._t2_max = 255.0
+        self._psf_var = tk.StringVar(value="3.0")
+        self._t1_entry_var = tk.StringVar(value="0.0")
+        self._t2_entry_var = tk.StringVar(value="0.0")
+
+        ttk.Label(parent, text="T₁ (Ch1):").grid(row=0, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_t1 = ttk.Entry(parent, textvariable=self._t1_entry_var, width=9)
+        self._entry_t1.grid(row=0, column=1, padx=4, sticky=tk.W)
+        self._entry_t1.bind("<Return>",    lambda e: self._entry_update(1))
+        self._entry_t1.bind("<FocusOut>",  lambda e: self._entry_update(1))
+
+        ttk.Label(parent, text="T₂ (Ch2):").grid(row=1, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_t2 = ttk.Entry(parent, textvariable=self._t2_entry_var, width=9)
+        self._entry_t2.grid(row=1, column=1, padx=4, sticky=tk.W)
+        self._entry_t2.bind("<Return>",   lambda e: self._entry_update(2))
+        self._entry_t2.bind("<FocusOut>", lambda e: self._entry_update(2))
+
+        ttk.Button(parent, text="Apply", command=lambda: self._slider_update(draw_plots=True)).grid(
+            row=0, column=2, rowspan=2, padx=8, sticky=tk.NS)
+
+        ttk.Label(parent, text="PSF (px, Costes randomization block):").grid(
+            row=2, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_psf = ttk.Entry(parent, textvariable=self._psf_var, width=9)
+        self._entry_psf.grid(row=2, column=1, padx=4, sticky=tk.W)
+
+        ttk.Label(parent, text="(press Enter or Tab to apply typed value)",
+                  foreground=GRAY, font=("TkDefaultFont", 8)).grid(
+            row=3, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 2))
+
+        parent.columnconfigure(1, weight=1)
+
+    def _get_psf_block_size(self) -> int:
+        """Get randomization block size in pixels from the PSF field."""
+        try:
+            psf_px = float(self._psf_var.get())
+        except ValueError:
+            psf_px = 3.0
+        if not np.isfinite(psf_px):
+            psf_px = 3.0
+        psf_px = max(2.0, psf_px)
+        self._psf_var.set(f"{psf_px:.1f}")
+        return int(round(psf_px))
+
+    def _entry_update(self, channel: int):
+        """Parse the manually typed threshold value and apply it."""
+        var    = self._t1_entry_var if channel == 1 else self._t2_entry_var
+        try:
+            val = float(var.get())
+        except ValueError:
+            var.set("0.0")
+            return
+        lo = 0.0
+        hi = self._t1_max if channel == 1 else self._t2_max
+        val = max(lo, min(hi, val))
+        var.set(f"{val:.1f}")
+        self._slider_update(draw_plots=True)
+
+    # ── image loading ──────────────────────────────────────────────────────────
+
+    def _load_file(self, title: str):
+        path = filedialog.askopenfilename(
+            title=title,
+            filetypes=[
+                ("Images", "*.tif *.tiff *.png *.jpg *.jpeg *.bmp"),
+                ("TIFF",   "*.tif *.tiff"),
+                ("All",    "*.*"),
+            ],
+        )
+        if not path:
+            return None
+
+        # ── try tifffile first (best for microscopy TIFFs) ──────────────────
+        if _HAS_TIFFFILE and path.lower().endswith((".tif", ".tiff")):
+            try:
+                img = tifffile.imread(path)
+                img = self._squeeze_to_2d(img)
+                return img.astype(np.float32)
+            except Exception:
+                pass
+
+        # ── fallback to Pillow ───────────────────────────────────────────────
+        if _HAS_PIL:
+            try:
+                pil = Image.open(path)
+                # keep 16-bit precision where possible
+                if pil.mode in ("I;16", "I;16B"):
+                    arr = np.frombuffer(pil.tobytes(), dtype=np.uint16
+                                        ).reshape(pil.size[1], pil.size[0])
+                elif pil.mode == "I":
+                    arr = np.array(pil, dtype=np.int32)
+                else:
+                    arr = np.array(pil.convert("L"), dtype=np.uint8)
+                return arr.astype(np.float32)
+            except Exception as exc:
+                messagebox.showerror("Load error", str(exc))
+                return None
+
+        messagebox.showerror(
+            "Missing library",
+            "Install 'tifffile' and/or 'Pillow':\n  pip install tifffile Pillow",
+        )
+        return None
+
+    @staticmethod
+    def _squeeze_to_2d(img: np.ndarray) -> np.ndarray:
+        """Reduce tifffile output to a 2-D (Y, X) grayscale array."""
+        if img.ndim == 2:
+            return img
+        if img.ndim == 3:
+            # XYC (H, W, C)
+            if img.shape[2] in (3, 4):
+                return img[..., :3].mean(axis=2)
+            # CXY (C, H, W)
+            if img.shape[0] in (3, 4):
+                return img[:3].mean(axis=0)
+            # single extra dim – take first slice (Z or T)
+            return img[0]
+        # ≥ 4-D: take first slice along all leading dims
+        while img.ndim > 2:
+            img = img[0]
+        return img
+
+    def load_ch1(self):
+        img = self._load_file("Open Channel 1")
+        if img is not None:
+            self._set_channels(ch1=img, ch2=self.ch2)
+            self._status.set(
+                f"Ch1 loaded — shape {img.shape}, "
+                f"range [{img.min():.0f}, {img.max():.0f}]"
+            )
+
+    def load_ch2(self):
+        img = self._load_file("Open Channel 2")
+        if img is not None:
+            self._set_channels(ch1=self.ch1, ch2=img)
+            self._status.set(
+                f"Ch2 loaded — shape {img.shape}, "
+                f"range [{img.min():.0f}, {img.max():.0f}]"
+            )
+
+    def load_demo_set(self):
+        preset = self._demo_preset_var.get()
+        ch1, ch2 = self._generate_demo_images(preset=preset)
+        self._set_channels(ch1=ch1, ch2=ch2)
+        self._status.set(
+            f"Demo set loaded — {preset}: {self._demo_presets[preset]}"
+        )
+
+    def export_demo_set(self):
+        if not _HAS_TIFFFILE:
+            messagebox.showerror(
+                "Missing dependency",
+                "TIFF export requires tifffile. Install with: pip install tifffile",
+            )
+            return
+
+        preset = self._demo_preset_var.get()
+        ch1, ch2 = self._generate_demo_images(preset=preset)
+        preset_slug = preset.lower().replace(" ", "_")
+
+        out_dir = Path(__file__).resolve().parent / "demo_exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ch1_path = out_dir / f"demo_{preset_slug}_ch1.tif"
+        ch2_path = out_dir / f"demo_{preset_slug}_ch2.tif"
+
+        # Export as uint16 for microscopy-style tooling compatibility.
+        tifffile.imwrite(ch1_path, np.clip(ch1, 0, 65535).astype(np.uint16))
+        tifffile.imwrite(ch2_path, np.clip(ch2, 0, 65535).astype(np.uint16))
+
+        self._status.set(
+            f"Demo TIFFs exported: {ch1_path.name}, {ch2_path.name}"
+        )
+
+    def _set_channels(self, ch1: np.ndarray | None, ch2: np.ndarray | None):
+        self.ch1 = ch1
+        self.ch2 = ch2
+        self.roi = None
+        self._refresh_images()
+        self._sync_slider_range()
+
+    @staticmethod
+    def _generate_demo_images(shape: tuple[int, int] = (256, 256),
+                              seed: int = 7,
+                              preset: str = "Partial overlap") -> tuple[np.ndarray, np.ndarray]:
+        """
+        Create a deterministic synthetic two-channel dataset for testing.
+
+        Design rationale
+        ----------------
+        The Costes algorithm finds a threshold by scanning T1 downward and
+        monitoring Pearson r of *below*-threshold pixels until r ≤ 0.  For
+        this to work, the background must be truly decorrelated between the
+        two channels.  Wide Gaussian spots (σ > 6 px, amplitude >> background)
+        have tails that span many pixels and maintain positive correlation at
+        ANY threshold below the spot peak, preventing the r-vs-T curve from
+        ever crossing zero.
+
+        We therefore use:
+        - σ = 4–6 px (tight), amplitude 800–1400 DN above flat 100 DN base.
+          The tail decays to background noise floor within ~10 px of the spot
+          centre, leaving ~95 % of all pixels as genuinely uncorrelated background.
+        - Background: independent per-channel Gaussian noise (no shared spatial
+          structure).  This forces r(background) ≈ 0 at Any threshold that
+          excludes the spot footprints, giving a clean Costes crossing.
+        """
+        seed_map = {
+            "High overlap":     seed,
+            "Partial overlap":  seed + 11,
+            "Offset structures": seed + 23,
+            "Low overlap":      seed + 37,
+            "Randomization demo": seed + 53,
+            "Randomization control": seed + 67,
+        }
+        rng = np.random.default_rng(seed_map.get(preset, seed + 11))
+        h, w = shape
+        yy, xx = np.mgrid[0:h, 0:w]
+
+        def gauss(cx, cy, sigma, amp):
+            return amp * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * sigma ** 2))
+
+        # Flat, fully INDEPENDENT background – ensures r(background) ≈ 0
+        ch1 = 100.0 + rng.normal(0.0, 28.0, shape)
+        ch2 =  95.0 + rng.normal(0.0, 28.0, shape)
+
+        if preset == "High overlap":
+            # High-overlap should have low diffuse baseline and dominant shared
+            # puncta, otherwise whole-image denominators suppress tM1/tM2.
+            ch1 = 10.0 + rng.normal(0.0, 3.0, shape)
+            ch2 = 10.0 + rng.normal(0.0, 3.0, shape)
+
+            # 8 tightly co-localised spots; minimal channel-specific signal
+            for cx, cy, s, a1, a2 in [
+                ( 54,  64, 4.8, 1300, 1260),
+                ( 96, 120, 5.6, 1580, 1520),
+                (148,  84, 4.8, 1220, 1180),
+                (192, 152, 6.0, 1760, 1700),
+                (122, 206, 5.2, 1380, 1330),
+                ( 62, 188, 4.8, 1160, 1110),
+                (206,  72, 4.4, 1260, 1210),
+                (168, 208, 4.8, 1240, 1190),
+            ]:
+                ch1 += gauss(cx,     cy, s,        a1)
+                ch2 += gauss(cx + 1, cy, s * 1.05, a2)
+            # Small channel-specific spots (~20-25% of shared amplitude)
+            for cx, cy, s, a in [(36, 34, 3.8, 300), (224, 44, 4.0, 320)]:
+                ch1 += gauss(cx, cy, s, a)
+            for cx, cy, s, a in [(42, 220, 3.8, 290), (210, 108, 4.0, 315)]:
+                ch2 += gauss(cx, cy, s, a)
+
+        elif preset == "Offset structures":
+            # 5 pairs displaced by 10–14 px (≈ 2–3 σ) – large offset, low true overlap
+            for cx, cy, s, a1, a2, dx, dy in [
+                ( 58,  68, 5.0, 1300, 1250,  12,   9),
+                (104, 124, 6.0, 1450, 1380, -13,   8),
+                (150,  90, 5.5, 1200, 1150,  10, -11),
+                (192, 156, 6.5, 1550, 1480, -11,  -9),
+                (118, 204, 5.0, 1280, 1200,   9,  12),
+            ]:
+                ch1 += gauss(cx,      cy,      s,        a1)
+                ch2 += gauss(cx + dx, cy + dy, s * 1.05, a2)
+            # Unique spots
+            for cx, cy, s, a in [(42, 34, 4.5, 750), (226, 114, 5.0, 700)]:
+                ch1 += gauss(cx, cy, s, a)
+            for cx, cy, s, a in [(218, 40, 4.5, 720), (38, 150, 5.0, 680)]:
+                ch2 += gauss(cx, cy, s, a)
+
+        elif preset == "Low overlap":
+            # Low-overlap should still yield a moderate Costes threshold, not
+            # an extreme value driven by a handful of very bright isolated
+            # puncta. Use lower-amplitude unique spots plus a weak broad shared
+            # haze so the r-vs-threshold curve crosses zero at a sensible level.
+            ch1 = 22.0 + rng.normal(0.0, 4.0, shape)
+            ch2 = 22.0 + rng.normal(0.0, 4.0, shape)
+
+            diffuse = rng.normal(0.0, 1.0, shape)
+            ch1 += 5.5 * diffuse
+            ch2 += 5.5 * diffuse
+
+            # Mostly independent spot populations with matched intensity budgets.
+            low_overlap_spots = [
+                (4.4, 340),
+                (4.8, 410),
+                (4.6, 370),
+                (5.0, 440),
+                (4.4, 390),
+            ]
+            for (cx, cy), (s, a) in zip(
+                [(40, 44), (92, 126), (156, 84), (214, 152), (122, 212)],
+                low_overlap_spots,
+            ):
+                ch1 += gauss(cx, cy, s, a)
+            for (cx, cy), (s, a) in zip(
+                [(210, 42), (156, 188), (78, 210), (44, 146), (206, 220)],
+                low_overlap_spots,
+            ):
+                ch2 += gauss(cx, cy, s, a)
+            # Weak shared component
+            ch1 += gauss(128, 128, 8.5, 70)
+            ch2 += gauss(128, 128, 8.5, 70)
+
+        elif preset == "Randomization demo":
+            # Designed to make Costes randomization behavior obvious:
+            # strong shared spatial structure yields high observed r, while
+            # block shuffling Ch2 suppresses r toward random baseline.
+            ch1 = 18.0 + rng.normal(0.0, 4.5, shape)
+            ch2 = 18.0 + rng.normal(0.0, 4.5, shape)
+
+            mesoscale = (
+                np.sin(xx / 12.0)
+                + 0.8 * np.cos(yy / 17.0)
+                + 0.6 * np.sin((xx + yy) / 21.0)
+            )
+            mesoscale = (mesoscale - mesoscale.min()) / (mesoscale.max() - mesoscale.min() + 1e-12)
+            ch1 += 240.0 * mesoscale
+            ch2 += 228.0 * mesoscale
+
+            for cx, cy, s, a in [
+                (40, 52, 5.0, 620),
+                (86, 94, 5.8, 700),
+                (132, 70, 4.6, 560),
+                (184, 118, 5.5, 680),
+                (220, 168, 5.2, 640),
+                (160, 208, 5.0, 600),
+            ]:
+                ch1 += gauss(cx, cy, s, a)
+                ch2 += gauss(cx + 1, cy - 1, s * 1.03, a * 0.96)
+
+            # Add channel-specific content so the dataset is not trivially identical.
+            for cx, cy, s, a in [(26, 210, 4.0, 300), (222, 44, 4.4, 320)]:
+                ch1 += gauss(cx, cy, s, a)
+            for cx, cy, s, a in [(44, 24, 4.2, 290), (206, 222, 4.2, 310)]:
+                ch2 += gauss(cx, cy, s, a)
+
+            shared_noise = rng.normal(0.0, 1.0, shape)
+            ch1 += 18.0 * shared_noise
+            ch2 += 17.0 * shared_noise
+
+        elif preset == "Randomization control":
+            # Negative control for randomization: mostly independent channel
+            # structures so observed r should be close to the randomized null.
+            ch1 = 36.0 + rng.normal(0.0, 5.5, shape)
+            ch2 = 36.0 + rng.normal(0.0, 5.5, shape)
+
+            # Independent puncta populations with matched intensity budgets.
+            for cx, cy, s, a in [
+                (34, 42, 4.2, 210),
+                (84, 122, 4.8, 250),
+                (142, 86, 4.4, 225),
+                (208, 156, 5.2, 270),
+                (126, 214, 4.6, 240),
+                (226, 56, 4.2, 220),
+            ]:
+                ch1 += gauss(cx, cy, s, a)
+
+            for cx, cy, s, a in [
+                (218, 40, 4.2, 210),
+                (160, 206, 4.8, 250),
+                (70, 214, 4.4, 225),
+                (44, 150, 5.2, 270),
+                (206, 222, 4.6, 240),
+                (120, 34, 4.2, 220),
+            ]:
+                ch2 += gauss(cx, cy, s, a)
+
+            # Only a very weak shared component to avoid exact zero-correlation.
+            weak_shared = rng.normal(0.0, 1.0, shape)
+            ch1 += 2.0 * weak_shared
+            ch2 += 2.0 * weak_shared
+
+        else:
+            # Partial overlap (default):
+            # Use matched baseline statistics and balanced structure budgets so
+            # M1 and M2 are moderately close (while still not identical).
+            ch1 = 36.0 + rng.normal(0.0, 5.0, shape)
+            ch2 = 36.0 + rng.normal(0.0, 5.0, shape)
+
+            # 3 fully shared + 2 slightly offset pairs + 4 channel-specific each
+            for cx, cy, s, a1, a2 in [
+                ( 98,  78, 4.8, 900, 880),
+                (150, 170, 5.2, 860, 840),
+                ( 64, 194, 4.6, 820, 800),
+            ]:
+                ch1 += gauss(cx, cy, s,        a1)
+                ch2 += gauss(cx, cy, s * 1.05, a2)
+            # Slightly offset pairs (offset 6–7 px ≈ 1.2 σ – partial pixel-level overlap)
+            for cx, cy, s, a1, a2, dx, dy in [
+                (200, 120, 4.8, 760, 740,  7,  6),
+                (110, 206, 5.0, 730, 710, -6,  7),
+            ]:
+                ch1 += gauss(cx,      cy,      s, a1)
+                ch2 += gauss(cx + dx, cy + dy, s, a2)
+            # Channel-specific
+            for cx, cy, s, a in [
+                ( 38,  34, 4.2, 840),
+                (142,  44, 4.6, 790),
+                (226, 208, 4.4, 850),
+                (208,  24, 4.4, 740),
+            ]:
+                ch1 += gauss(cx, cy, s, a)
+            for cx, cy, s, a in [
+                (224,  42, 4.2, 830),
+                ( 44, 136, 4.8, 800),
+                (160, 226, 4.4, 860),
+                (186,  30, 4.6, 760),
+            ]:
+                ch2 += gauss(cx, cy, s, a)
+
+            # Equalize global intensity budget to avoid built-in channel bias.
+            ch2 *= ch1.sum() / max(ch2.sum(), 1e-12)
+
+        # A handful of hot pixels to test threshold robustness (not too bright)
+        hot_lo, hot_hi = (200, 450)
+        if preset == "Randomization control":
+            # Keep this control at a moderate dynamic range to avoid
+            # high-threshold picks driven by very sparse bright outliers.
+            hot_lo, hot_hi = (40, 120)
+
+        hy = rng.integers(0, h, size=12)
+        hx = rng.integers(0, w, size=12)
+        ch1[hy, hx] += rng.uniform(hot_lo, hot_hi, size=12)
+        hy = rng.integers(0, h, size=12)
+        hx = rng.integers(0, w, size=12)
+        ch2[hy, hx] += rng.uniform(hot_lo, hot_hi, size=12)
+
+        ch1 = np.clip(ch1, 0, 4095).astype(np.float32)
+        ch2 = np.clip(ch2, 0, 4095).astype(np.float32)
+        return ch1, ch2
+
+    def _sync_slider_range(self):
+        if self.ch1 is not None:
+            self._t1_max = float(self.ch1.max())
+        if self.ch2 is not None:
+            self._t2_max = float(self.ch2.max())
+
+    # ── image display ──────────────────────────────────────────────────────────
+
+    def _refresh_images(self):
+        ax0, ax1 = self._img_axes
+        ax0.cla(); ax1.cla()
+        ax0.set_facecolor("#111122"); ax1.set_facecolor("#111122")
+        ax0.set_title("Channel 1", color=CYAN,    fontsize=10)
+        ax1.set_title("Channel 2", color=MAGENTA, fontsize=10)
+
+        if self.ch1 is not None:
+            ax0.imshow(self.ch1, cmap=_CYAN,    origin="upper",
+                       vmin=0, vmax=self.ch1.max())
+        if self.ch2 is not None:
+            ax1.imshow(self.ch2, cmap=_MAGENTA, origin="upper",
+                       vmin=0, vmax=self.ch2.max())
+
+        if self.roi is not None:
+            x1, y1, x2, y2 = self.roi
+            # Channel 1 ROI is shown by the live RectangleSelector when active.
+            if not self._roi_active:
+                ax0.add_patch(Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=2, edgecolor=YELLOW, facecolor="none",
+                ))
+            ax1.add_patch(Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=2, edgecolor=YELLOW, facecolor="none",
+            ))
+
+        for ax in self._img_axes:
+            ax.axis("off")
+        self._img_fig.tight_layout(pad=1.2)
+        self._img_canvas.draw_idle()
+
+    # ── ROI ────────────────────────────────────────────────────────────────────
+
+    def toggle_roi(self):
+        if self.ch1 is None:
+            messagebox.showwarning("No image", "Load Channel 1 first.")
+            return
+        self._roi_active = not self._roi_active
+        self._roi_sel.set_active(self._roi_active)
+        self._roi_btn.config(
+            text="Cancel ROI" if self._roi_active else "Draw ROI"
+        )
+        if self._roi_active:
+            self._status.set("Click and drag on the Channel-1 image to draw ROI.")
+
+    def _on_roi_select(self, eclick, erelease):
+        if eclick.xdata is None or erelease.xdata is None:
+            return
+        x1, x2 = sorted([eclick.xdata, erelease.xdata])
+        y1, y2 = sorted([eclick.ydata, erelease.ydata])
+        if self.ch1 is not None:
+            h, w = self.ch1.shape[:2]
+            x1 = max(0, int(x1)); x2 = min(w, int(x2))
+            y1 = max(0, int(y1)); y2 = min(h, int(y2))
+        if (x2 - x1) > 5 and (y2 - y1) > 5:
+            self.roi = (x1, y1, x2, y2)
+            # Keep the selector active so the ROI remains editable via handles.
+            self._roi_active = True
+            self._roi_sel.set_active(True)
+            self._roi_sel.extents = (x1, x2, y1, y2)
+            self._roi_btn.config(text="Cancel ROI")
+            self._schedule_secondary_roi_overlay()
+            self._img_canvas.draw_idle()
+        self._status.set(
+            f"ROI: x=[{x1}, {x2}], y=[{y1}, {y2}]  —  Drag handles to refine or click 'Run Costes + Analyze'."
+        )
+
+    def clear_roi(self):
+        self.roi = None
+        self._roi_sel.clear()
+        self._roi_sel.set_active(self._roi_active)
+        self._refresh_images()
+        self._update_secondary_roi_overlay()
+        self._status.set("ROI cleared — full image will be used.")
+
+    def _schedule_secondary_roi_overlay(self):
+        """Coalesce Ch2 ROI overlay updates to the next idle UI tick."""
+        if self._roi_overlay_after_id is not None:
+            try:
+                self.root.after_cancel(self._roi_overlay_after_id)
+            except tk.TclError:
+                pass
+        self._roi_overlay_after_id = self.root.after_idle(self._update_secondary_roi_overlay)
+
+    def _update_secondary_roi_overlay(self):
+        """Update the passive ROI rectangle on Channel 2 without resetting selector handles."""
+        self._roi_overlay_after_id = None
+        ax1 = self._img_axes[1]
+        for p in list(ax1.patches):
+            p.remove()
+        if self.roi is not None:
+            x1, y1, x2, y2 = self.roi
+            ax1.add_patch(Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=2, edgecolor=YELLOW, facecolor="none",
+            ))
+        self._img_canvas.draw_idle()
+
+    # ── data extraction ────────────────────────────────────────────────────────
+
+    def _get_roi_arrays(self):
+        if self.ch1 is None or self.ch2 is None:
+            return None, None
+        if self.ch1.shape[:2] != self.ch2.shape[:2]:
+            messagebox.showerror(
+                "Shape mismatch",
+                "Both channels must have identical spatial dimensions.\n"
+                f"Ch1: {self.ch1.shape}   Ch2: {self.ch2.shape}",
+            )
+            return None, None
+        if self.roi:
+            x1, y1, x2, y2 = self.roi
+            c1 = self.ch1[y1:y2, x1:x2]
+            c2 = self.ch2[y1:y2, x1:x2]
+        else:
+            c1 = self.ch1
+            c2 = self.ch2
+        return c1, c2
+
+    def _get_pixels(self):
+        c1_img, c2_img = self._get_roi_arrays()
+        if c1_img is None:
+            return None, None
+        c1 = c1_img.ravel()
+        c2 = c2_img.ravel()
+        return c1, c2
+
+    # ── Costes algorithm ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def costes_threshold(c1: np.ndarray, c2: np.ndarray, n_steps: int = 1024):
+        """
+        Costes automatic threshold algorithm (Costes et al., 2004).
+
+        Steps
+        -----
+        1. Fit linear regression  Ch2 = a·Ch1 + b  through all pixels.
+        2. Starting from max(Ch1) decrease T1; paired T2 = a·T1 + b.
+        3. At each step compute Pearson's r for pixels BELOW the threshold
+           pair: c1 < T1 AND c2 < T2.  These are the putative background
+           pixels; they should be uncorrelated (r ≤ 0) when the threshold
+           sits above all real signal.
+        4. The threshold is the FIRST T1 (scanning high → low) at which
+           r_background ≤ 0.  Above this threshold, background has no
+              positive correlation – only genuine colocalized signal remains.
+              A minimum foreground-support rule is applied to avoid selecting a
+              threshold when only a tiny high-intensity tail remains.
+
+        Returns
+        -------
+        t1, t2 : optimal threshold values
+        slope, intercept : regression coefficients
+        curve_t1, curve_r : r of below-threshold pixels at each step
+        """
+        res = stats.linregress(c1, c2)
+        slope, intercept = float(res.slope), float(res.intercept)
+
+        max1, min1 = float(c1.max()), float(c1.min())
+        max2        = float(c2.max())
+        candidates  = np.linspace(max1, min1, n_steps + 1)   # high → low
+
+        n_total = len(c1)
+        min_fg_pixels = max(100, int(0.005 * n_total))
+
+        curve_t1, curve_r = [], []
+        # Track the candidate with the lowest r seen so far (fallback if no
+        # zero-crossing is found — happens with residual background correlation).
+        best_r      = float("inf")
+        best_r_any  = float("inf")
+        t1_opt      = float(np.percentile(c1, 95))   # conservative fallback
+        t2_opt      = float(np.clip(slope * t1_opt + intercept, 0.0, max2))
+        t1_opt_any  = t1_opt
+        t2_opt_any  = t2_opt
+
+        for t1_cand in candidates:
+            t2_cand = float(np.clip(slope * t1_cand + intercept, 0.0, max2))
+
+            # Background = pixels BELOW both thresholds
+            mask = (c1 < t1_cand) & (c2 < t2_cand)
+            if mask.sum() < 10:
+                continue
+            c1b, c2b = c1[mask], c2[mask]
+            if c1b.std() < 1e-9 or c2b.std() < 1e-9:
+                continue
+
+            r = float(stats.pearsonr(c1b, c2b)[0])
+            curve_t1.append(t1_cand)
+            curve_r.append(r)
+
+            fg_count = n_total - int(mask.sum())
+            fg1_count = int(np.count_nonzero(c1 >= t1_cand))
+            fg2_count = int(np.count_nonzero(c2 >= t2_cand))
+            has_channel_support = (
+                fg1_count >= min_fg_pixels and fg2_count >= min_fg_pixels
+            )
+
+            # Keep a global fallback regardless of support.
+            if r < best_r_any:
+                best_r_any = r
+                t1_opt_any = t1_cand
+                t2_opt_any = t2_cand
+
+            # Supported candidates only: avoid tiny foreground tails.
+            if fg_count >= min_fg_pixels and has_channel_support and r < best_r:
+                best_r = r
+                t1_opt = t1_cand
+                t2_opt = t2_cand
+
+            if r <= 0.0 and fg_count >= min_fg_pixels and has_channel_support:
+                # Background is uncorrelated → genuine Costes threshold found
+                break
+
+        # If no supported candidate was found, fall back to the global minimum-r.
+        if best_r == float("inf"):
+            t1_opt, t2_opt = t1_opt_any, t2_opt_any
+
+        return (
+            t1_opt, t2_opt,
+            slope, intercept,
+            np.asarray(curve_t1), np.asarray(curve_r),
+        )
+
+    # ── Mander's coefficients ──────────────────────────────────────────────────
+
+    @staticmethod
+    def manders(c1: np.ndarray, c2: np.ndarray,
+                t1: float, t2: float) -> dict:
+        """
+        Compute Mander's Overlap Coefficients and related metrics.
+
+        M1  : fraction of Ch1 signal that overlaps with Ch2 signal above T₂
+        M2  : fraction of Ch2 signal that overlaps with Ch1 signal above T₁
+        tM1 : thresholded M1 – only pixels where BOTH channels exceed threshold
+        tM2 : thresholded M2
+        overlap : Manders (1993) overlap coefficient R
+        k1, k2  : partitioning coefficients
+        pearson : Pearson's r restricted to pixels above both thresholds
+        """
+        s1, s2 = c1.sum(), c2.sum()
+        mask2     = c2 > t2
+        mask1     = c1 > t1
+        mask_both = mask1 & mask2
+
+        m1  = c1[mask2].sum() / s1     if s1 > 0 else 0.0
+        m2  = c2[mask1].sum() / s2     if s2 > 0 else 0.0
+        tm1 = c1[mask_both].sum() / s1 if s1 > 0 else 0.0
+        tm2 = c2[mask_both].sum() / s2 if s2 > 0 else 0.0
+
+        # Overlap R and k-coefficients (positive pixels only)
+        pos  = (c1 > 0) & (c2 > 0)
+        a, b = c1[pos].astype(np.float64), c2[pos].astype(np.float64)
+        dR   = np.sqrt((a ** 2).sum() * (b ** 2).sum())
+        d1   = (a ** 2).sum()
+        d2   = (b ** 2).sum()
+        ab   = (a * b).sum()
+        overlap = ab / dR if dR > 0 else 0.0
+        k1      = ab / d1 if d1 > 0 else 0.0
+        k2      = ab / d2 if d2 > 0 else 0.0
+
+        # Pearson r above thresholds
+        c1b, c2b = c1[mask_both], c2[mask_both]
+        if len(c1b) > 5 and c1b.std() > 0 and c2b.std() > 0:
+            pearson = float(stats.pearsonr(c1b, c2b)[0])
+        else:
+            pearson = float("nan")
+
+        return dict(m1=m1, m2=m2, tm1=tm1, tm2=tm2,
+                    overlap=overlap, k1=k1, k2=k2, pearson=pearson)
+
+    @staticmethod
+    def costes_randomization(c1_img: np.ndarray, c2_img: np.ndarray,
+                             n_iter: int = 100, block_size: int | None = None,
+                             seed: int = 12345) -> dict:
+        """
+        Costes randomization significance test.
+
+        Channel 2 is partitioned into square blocks and block order is
+        randomized repeatedly. This preserves local intensity structure within
+        each block while destroying cross-channel spatial correspondence.
+        The block size should reflect the microscope PSF scale (in pixels), as
+        done in Coloc2.
+        """
+        h, w = c1_img.shape
+        min_dim = min(h, w)
+        if min_dim < 8:
+            return dict(observed_r=float("nan"), random_mean=float("nan"),
+                        random_std=float("nan"), significance=float("nan"),
+                        p_value=float("nan"), block_size=0, n_iter=0)
+
+        if block_size is None:
+            if min_dim >= 128:
+                block_size = 8
+            elif min_dim >= 64:
+                block_size = 4
+            else:
+                block_size = 2
+
+        block_size = max(2, min(block_size, min_dim))
+        crop_h = (h // block_size) * block_size
+        crop_w = (w // block_size) * block_size
+        if crop_h < block_size or crop_w < block_size:
+            return dict(observed_r=float("nan"), random_mean=float("nan"),
+                        random_std=float("nan"), significance=float("nan"),
+                        p_value=float("nan"), block_size=block_size, n_iter=0)
+
+        c1_crop = c1_img[:crop_h, :crop_w]
+        c2_crop = c2_img[:crop_h, :crop_w]
+        c1_flat = c1_crop.ravel()
+        c2_flat = c2_crop.ravel()
+        if c1_flat.std() < 1e-9 or c2_flat.std() < 1e-9:
+            return dict(observed_r=float("nan"), random_mean=float("nan"),
+                        random_std=float("nan"), significance=float("nan"),
+                        p_value=float("nan"), block_size=block_size, n_iter=0)
+
+        observed_r = float(stats.pearsonr(c1_flat, c2_flat)[0])
+
+        ny = crop_h // block_size
+        nx = crop_w // block_size
+        blocks = c2_crop.reshape(ny, block_size, nx, block_size).transpose(0, 2, 1, 3)
+        blocks = blocks.reshape(ny * nx, block_size, block_size)
+
+        rng = np.random.default_rng(seed)
+        randomized_r = np.empty(n_iter, dtype=np.float64)
+        for idx in range(n_iter):
+            perm = rng.permutation(blocks.shape[0])
+            shuffled = blocks[perm].reshape(ny, nx, block_size, block_size)
+            shuffled = shuffled.transpose(0, 2, 1, 3).reshape(crop_h, crop_w)
+            randomized_r[idx] = float(stats.pearsonr(c1_flat, shuffled.ravel())[0])
+
+        random_mean = float(randomized_r.mean())
+        random_std = float(randomized_r.std(ddof=1)) if n_iter > 1 else 0.0
+        significance = 100.0 * float(np.mean(randomized_r < observed_r))
+        p_value = (float(np.sum(randomized_r >= observed_r)) + 1.0) / (n_iter + 1.0)
+
+        return dict(
+            observed_r=observed_r,
+            random_mean=random_mean,
+            random_std=random_std,
+            significance=significance,
+            p_value=p_value,
+            block_size=block_size,
+            n_iter=n_iter,
+        )
+
+    # ── analysis entry point ───────────────────────────────────────────────────
+
+    def run_analysis(self):
+        c1_img, c2_img = self._get_roi_arrays()
+        if c1_img is None:
+            messagebox.showwarning("Missing data", "Load both channel images first.")
+            return
+        c1 = c1_img.ravel()
+        c2 = c2_img.ravel()
+
+        self._status.set("Running Costes algorithm…")
+        self.root.update_idletasks()
+
+        t1, t2, slope, intercept, curve_t, curve_r = self.costes_threshold(c1, c2)
+        self._last_costes_slope = slope
+        self._last_costes_intercept = intercept
+        self._last_costes_curve_t = curve_t
+        self._last_costes_curve_r = curve_r
+        res = self.manders(c1, c2, t1, t2)
+        self._status.set("Running Costes randomization…")
+        self.root.update_idletasks()
+        rand = self.costes_randomization(
+            c1_img,
+            c2_img,
+            block_size=self._get_psf_block_size(),
+        )
+
+        # update threshold entry fields
+        self._t1_entry_var.set(f"{t1:.1f}")
+        self._t2_entry_var.set(f"{t2:.1f}")
+
+        # update results
+        self._rv["costes_t1"].set(f"{t1:.2f}")
+        self._rv["costes_t2"].set(f"{t2:.2f}")
+        for k in ("m1", "m2", "tm1", "tm2", "overlap", "k1", "k2"):
+            self._rv[k].set(f"{res[k]:.4f}")
+        p = res["pearson"]
+        self._rv["pearson"].set(f"{p:.4f}" if not np.isnan(p) else "N/A")
+        obs_r = rand["observed_r"]
+        if np.isnan(obs_r):
+            self._rv["costes_r_obs"].set("N/A")
+            self._rv["costes_r_rand"].set("N/A")
+            self._rv["costes_sig"].set("N/A")
+            self._rv["costes_p"].set("N/A")
+        else:
+            self._rv["costes_r_obs"].set(
+                f"r={obs_r:.4f}  (block={rand['block_size']}, n={rand['n_iter']})"
+            )
+            self._rv["costes_r_rand"].set(
+                f"{rand['random_mean']:.4f} ± {rand['random_std']:.4f}"
+            )
+            self._rv["costes_sig"].set(f"{rand['significance']:.1f} %")
+            self._rv["costes_p"].set(f"{rand['p_value']:.4f}")
+
+        # plots
+        self._draw_histograms(c1, c2, t1, t2)
+        self._draw_costes(c1, c2, t1, t2, slope, intercept, curve_t, curve_r)
+
+        self._status.set(
+            f"Done  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
+            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  |  "
+            f"Costes sig={rand['significance']:.1f}%"
+        )
+
+    def _slider_update(self, _=None, draw_plots: bool = True):
+        try:
+            t1 = float(self._t1_entry_var.get())
+        except ValueError:
+            t1 = 0.0
+        try:
+            t2 = float(self._t2_entry_var.get())
+        except ValueError:
+            t2 = 0.0
+        t1 = max(0.0, min(self._t1_max, t1))
+        t2 = max(0.0, min(self._t2_max, t2))
+        self._t1_entry_var.set(f"{t1:.1f}")
+        self._t2_entry_var.set(f"{t2:.1f}")
+        self._rv["costes_t1"].set(f"{t1:.2f}")
+        self._rv["costes_t2"].set(f"{t2:.2f}")
+        c1, c2 = self._get_pixels()
+        if c1 is None:
+            return
+        res = self.manders(c1, c2, t1, t2)
+        for k in ("m1", "m2", "tm1", "tm2", "overlap", "k1", "k2"):
+            self._rv[k].set(f"{res[k]:.4f}")
+        p = res["pearson"]
+        self._rv["pearson"].set(f"{p:.4f}" if not np.isnan(p) else "N/A")
+        if draw_plots:
+            self._draw_histograms(c1, c2, t1, t2)
+            if self._last_costes_slope is not None and self._last_costes_intercept is not None:
+                self._draw_costes(
+                    c1, c2, t1, t2,
+                    self._last_costes_slope,
+                    self._last_costes_intercept,
+                    self._last_costes_curve_t,
+                    self._last_costes_curve_r,
+                )
+
+        self._status.set(
+            f"Manual thresholds applied  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
+            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}"
+        )
+
+    # ── plots ──────────────────────────────────────────────────────────────────
+
+    def _style_ax(self, ax, title="", xlabel="", ylabel="", title_color=FG):
+        ax.set_facecolor("#11111e")
+        ax.tick_params(colors=FG, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(GRAY)
+        ax.set_title(title,  color=title_color, fontsize=10)
+        ax.set_xlabel(xlabel, color=FG,          fontsize=9)
+        ax.set_ylabel(ylabel, color=FG,          fontsize=9)
+
+    def _draw_histograms(self, c1: np.ndarray, c2: np.ndarray,
+                         t1: float, t2: float):
+        ax1, ax2 = self._hist_axes
+        ax1.cla(); ax2.cla()
+
+        def _hist_one(ax, data, color, title, thresh):
+            n_bins = min(512, max(64, int(data.max() - data.min()) + 1))
+            # all pixels
+            ax.hist(data, bins=n_bins, color=color, alpha=0.70,
+                    log=True, linewidth=0, label="All pixels")
+            # pixels above threshold (highlight)
+            above = data[data >= thresh]
+            pct   = 100 * len(above) / max(len(data), 1)
+            if len(above):
+                ax.hist(above, bins=n_bins, color="white", alpha=0.30,
+                        log=True, linewidth=0,
+                        label=f"Above threshold  ({pct:.1f} %)")
+            threshold_line = ax.axvline(
+                thresh, color=YELLOW, linewidth=2, linestyle="--",
+                label=f"T = {thresh:.1f}"
+            )
+            self._style_ax(ax, title=title,
+                           xlabel="Intensity", ylabel="Pixel count (log)",
+                           title_color=color)
+            ax.legend(fontsize=7, facecolor="#111122",
+                      labelcolor="white", framealpha=0.9)
+            return threshold_line
+
+        self._hist_t1_line = _hist_one(ax1, c1, CYAN,    "Channel 1  Intensity Histogram", t1)
+        self._hist_t2_line = _hist_one(ax2, c2, MAGENTA, "Channel 2  Intensity Histogram", t2)
+
+        self._hist_fig.tight_layout()
+        self._hist_canvas.draw_idle()
+
+    def _update_hist_threshold_lines(self, t1: float, t2: float):
+        """Move only the threshold guide lines without recomputing plots."""
+        if self._hist_t1_line is None or self._hist_t2_line is None:
+            return
+        self._hist_t1_line.set_xdata([t1, t1])
+        self._hist_t2_line.set_xdata([t2, t2])
+        self._hist_t1_line.set_label(f"T = {t1:.1f}")
+        self._hist_t2_line.set_label(f"T = {t2:.1f}")
+        self._hist_canvas.draw_idle()
+
+    def _draw_costes(self, c1: np.ndarray, c2: np.ndarray,
+                     t1: float, t2: float,
+                     slope: float, intercept: float,
+                     curve_t: np.ndarray, curve_r: np.ndarray):
+
+        ax_sc, ax_r = self._costes_axes
+        ax_sc.cla(); ax_r.cla()
+
+        # ── scatter plot ───────────────────────────────────────────────────────
+        n = len(c1)
+        rng = np.random.default_rng(42)
+        if n > 30_000:
+            idx = rng.choice(n, 30_000, replace=False)
+            sc1, sc2 = c1[idx], c2[idx]
+        else:
+            sc1, sc2 = c1, c2
+
+        above = (sc1 >= t1) & (sc2 >= t2)
+        ax_sc.scatter(sc1[~above], sc2[~above], c="#2d4a5e", s=1,
+                      alpha=0.4, rasterized=True, label="Non-colocalizing")
+        ax_sc.scatter(sc1[above],  sc2[above],  c="gold",    s=2,
+                      alpha=0.8, rasterized=True, label="Colocalizing")
+
+        # regression line
+        xr = np.array([c1.min(), c1.max()])
+        ax_sc.plot(xr, slope * xr + intercept, color="tomato",
+                   linewidth=1.5, label=f"Regression  a={slope:.3f}")
+
+        # threshold crosshairs
+        ax_sc.axvline(t1, color=CYAN,    linewidth=1.5, linestyle="--",
+                      label=f"T₁ = {t1:.1f}")
+        ax_sc.axhline(t2, color=MAGENTA, linewidth=1.5, linestyle="--",
+                      label=f"T₂ = {t2:.1f}")
+
+        # shade colocalization quadrant
+        ax_sc.axvspan(t1, c1.max(), alpha=0.06, color=CYAN)
+        ax_sc.axhspan(t2, c2.max(), alpha=0.06, color=MAGENTA)
+
+        self._style_ax(ax_sc,
+                       title="Pixel Scatter  (Costes thresholds)",
+                       xlabel="Channel 1 Intensity",
+                       ylabel="Channel 2 Intensity")
+        ax_sc.legend(fontsize=7, facecolor="#111122",
+                     labelcolor="white", framealpha=0.9, markerscale=4)
+
+        # ── Costes r-vs-threshold curve ────────────────────────────────────────
+        if len(curve_t) > 1:
+            curve_r_arr = np.asarray(curve_r)
+            ax_r.plot(curve_t, curve_r_arr, color="white",
+                      linewidth=1.8, label="r(background)  vs  T₁")
+            # r > 0: background pixels still correlate → threshold too high
+            ax_r.fill_between(curve_t, curve_r_arr, 0,
+                               where=(curve_r_arr > 0),
+                               color="steelblue", alpha=0.30,
+                               label="r > 0  (signal leaks into background)")
+            # r ≤ 0: background is uncorrelated → threshold is at or above signal
+            ax_r.fill_between(curve_t, curve_r_arr, 0,
+                               where=(curve_r_arr <= 0),
+                               color="#a6e3a1", alpha=0.35,
+                               label="r ≤ 0  (background uncorrelated ✓)")
+            ax_r.axhline(0, color="red", linewidth=1.2, linestyle=":")
+            ax_r.axvline(t1, color=YELLOW, linewidth=2, linestyle="-.",
+                         label=f"Costes T₁ = {t1:.1f}")
+            self._style_ax(ax_r,
+                           title="Costes:  r of BELOW-threshold pixels vs T₁\n"
+                                 "(threshold = first T₁ where r_background ≤ 0)",
+                           xlabel="Ch1 Threshold  (decreasing →)",
+                           ylabel="Pearson's r  (background pixels)")
+            ax_r.legend(fontsize=7, facecolor="#111122",
+                        labelcolor="white", framealpha=0.9)
+            ax_r.invert_xaxis()   # show threshold decreasing left to right
+        else:
+            self._style_ax(ax_r, title="Costes curve  (insufficient data)",
+                           xlabel="Ch1 Threshold", ylabel="Pearson's r")
+
+        self._costes_fig.tight_layout()
+        self._costes_canvas.draw_idle()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    root = tk.Tk()
+    try:
+        root.tk.call("tk", "scaling", 1.5)
+    except tk.TclError:
+        pass
+    ColocalizationApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
