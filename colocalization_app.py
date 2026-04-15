@@ -18,6 +18,7 @@ Features
 - Scatter plot coloured by colocalization status and Pearson's-r-vs-threshold
   curve that illustrates how the Costes threshold is found.
 - Manual threshold input boxes for live recalculation of the Manders coefficients.
+- Save a PDF summary report with metrics and current plots.
 
 Dependencies
 ------------
@@ -27,6 +28,7 @@ Dependencies
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import warnings
@@ -37,6 +39,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 
@@ -143,6 +146,7 @@ class ColocalizationApp:
         ttk.Button(tb, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=3)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(tb, text="Run Costes + Analyze", command=self.run_analysis).pack(side=tk.LEFT, padx=3)
+        ttk.Button(tb, text="Save PDF Summary", command=self.save_pdf_summary).pack(side=tk.LEFT, padx=3)
         ttk.Button(tb, text="Quit", command=self.root.destroy).pack(side=tk.LEFT, padx=3)
 
         self._status = tk.StringVar(value="Load two single-channel images to begin.")
@@ -1323,6 +1327,97 @@ class ColocalizationApp:
 
         self._costes_fig.tight_layout()
         self._costes_canvas.draw_idle()
+
+    # ── PDF export ────────────────────────────────────────────────────────────
+
+    def save_pdf_summary(self):
+        """Export a PDF report with current metrics and visualizations."""
+        if self.ch1 is None or self.ch2 is None:
+            messagebox.showwarning("Missing data", "Load both channel images first.")
+            return
+
+        default_name = f"colocalization_summary_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+        out_path = filedialog.asksaveasfilename(
+            title="Save PDF Summary",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not out_path:
+            return
+
+        if not out_path.lower().endswith(".pdf"):
+            out_path += ".pdf"
+
+        if self.roi is None:
+            roi_text = "Full image"
+        else:
+            x1, y1, x2, y2 = self.roi
+            roi_text = f"x=[{x1}, {x2}], y=[{y1}, {y2}]"
+
+        has_analysis = self._rv["costes_t1"].get() != "—"
+        metrics = [
+            ("Costes T1", self._rv["costes_t1"].get()),
+            ("Costes T2", self._rv["costes_t2"].get()),
+            ("M1", self._rv["m1"].get()),
+            ("M2", self._rv["m2"].get()),
+            ("tM1", self._rv["tm1"].get()),
+            ("tM2", self._rv["tm2"].get()),
+            ("Pearson r", self._rv["pearson"].get()),
+            ("Overlap R", self._rv["overlap"].get()),
+            ("k1", self._rv["k1"].get()),
+            ("k2", self._rv["k2"].get()),
+            ("Costes observed r", self._rv["costes_r_obs"].get()),
+            ("Randomized r mean ± SD", self._rv["costes_r_rand"].get()),
+            ("Costes significance", self._rv["costes_sig"].get()),
+            ("Monte Carlo p", self._rv["costes_p"].get()),
+        ]
+
+        try:
+            with PdfPages(out_path) as pdf:
+                # First page: human-readable metrics table and run metadata.
+                summary_fig = plt.figure(figsize=(8.27, 11.69), facecolor="white")
+                ax = summary_fig.add_axes([0.06, 0.06, 0.88, 0.88])
+                ax.axis("off")
+
+                lines = [
+                    "Colocalization Analyzer - PDF Summary",
+                    "",
+                    f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Image shape: {self.ch1.shape}",
+                    f"ROI: {roi_text}",
+                    "",
+                ]
+
+                if has_analysis:
+                    lines.append("Results")
+                    lines.append("-" * 72)
+                    for label, value in metrics:
+                        lines.append(f"{label:<28} {value}")
+                else:
+                    lines.append("No analysis results available yet.")
+                    lines.append("Run 'Costes + Analyze' first to populate metrics.")
+
+                ax.text(
+                    0.0, 1.0,
+                    "\n".join(lines),
+                    va="top", ha="left",
+                    fontsize=10,
+                    family="monospace",
+                    color="black",
+                )
+                pdf.savefig(summary_fig)
+                plt.close(summary_fig)
+
+                # Following pages: current UI figures exactly as shown.
+                pdf.savefig(self._img_fig)
+                pdf.savefig(self._hist_fig)
+                pdf.savefig(self._costes_fig)
+
+            self._status.set(f"PDF summary saved: {Path(out_path).name}")
+            messagebox.showinfo("Export complete", f"Saved PDF summary:\n{out_path}")
+        except Exception as exc:
+            messagebox.showerror("Export error", str(exc))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
