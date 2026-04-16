@@ -107,6 +107,7 @@ class ColocalizationApp:
             "Partial overlap": "Mixed shared, offset, and channel-specific structures.",
             "Offset structures": "Similar objects with systematic spatial offsets.",
             "Low overlap": "Mostly independent objects with weak diffuse correlation.",
+            "Pure bleedthrough": "Channel 2 is dominated by linear bleed-through from channel 1.",
             "Randomization demo": "Aligned mesoscale structure: high observed r, low shuffled r.",
             "Randomization control": "Mostly independent channels: shuffled r similar to observed r.",
         }
@@ -769,6 +770,7 @@ class ColocalizationApp:
             "Partial overlap":  seed + 11,
             "Offset structures": seed + 23,
             "Low overlap":      seed + 37,
+            "Pure bleedthrough": seed + 47,
             "Randomization demo": seed + 53,
             "Randomization control": seed + 67,
         }
@@ -858,6 +860,34 @@ class ColocalizationApp:
             # Weak shared component
             ch1 += gauss(128, 128, 8.5, 70)
             ch2 += gauss(128, 128, 8.5, 70)
+
+        elif preset == "Pure bleedthrough":
+            # Simulate optical bleed-through: Ch2 is mostly a scaled copy of Ch1
+            # plus detector/background noise, with no channel-specific structures.
+            ch1 = 28.0 + rng.normal(0.0, 5.5, shape)
+
+            for cx, cy, s, a in [
+                (42, 56, 4.6, 900),
+                (88, 118, 5.2, 980),
+                (136, 84, 4.8, 860),
+                (182, 142, 5.8, 1040),
+                (220, 92, 4.4, 820),
+                (164, 204, 5.0, 920),
+                (74, 196, 4.6, 840),
+            ]:
+                ch1 += gauss(cx, cy, s, a)
+
+            # Add broad diffuse structure to make the bleed-through pattern obvious.
+            mesoscale = (
+                0.9 * np.sin(xx / 15.0)
+                + 0.7 * np.cos(yy / 18.0)
+                + 0.5 * np.sin((xx + yy) / 24.0)
+            )
+            mesoscale = (mesoscale - mesoscale.min()) / (mesoscale.max() - mesoscale.min() + 1e-12)
+            ch1 += 180.0 * mesoscale
+
+            bleed_frac = 0.38
+            ch2 = (12.0 + rng.normal(0.0, 5.0, shape)) + (bleed_frac * ch1)
 
         elif preset == "Randomization demo":
             # Designed to make Costes randomization behavior obvious:
