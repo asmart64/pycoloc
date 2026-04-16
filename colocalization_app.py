@@ -1528,7 +1528,8 @@ class ColocalizationApp:
 
         self._status.set(
             f"Done  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
-            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  |  "
+            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  "
+            f"tM1={res['tm1']:.3f}  tM2={res['tm2']:.3f}  |  "
             f"Costes sig={rand['significance']:.1f}%"
             + ("  |  hot-pixel preprocess ON" if use_preprocess else "")
             + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
@@ -1570,7 +1571,8 @@ class ColocalizationApp:
 
         self._status.set(
             f"Manual thresholds applied  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
-            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}"
+            f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  "
+            f"tM1={res['tm1']:.3f}  tM2={res['tm2']:.3f}"
         )
 
     # ── plots ──────────────────────────────────────────────────────────────────
