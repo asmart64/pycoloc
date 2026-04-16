@@ -90,9 +90,8 @@ class ColocalizationApp:
         self.root = root
         self.root.title("Colocalization Analyzer — Mander's Coefficients")
         self.root.configure(bg=BG2)
-        # MacBook-friendly default size while keeping enough room for plots.
-        self.root.geometry("1320x820")
-        self.root.minsize(1100, 700)
+        # Use a screen-aware startup size so the window never opens off-screen.
+        self._set_initial_window_geometry()
 
         # application state
         self.ch1: np.ndarray | None = None
@@ -116,56 +115,77 @@ class ColocalizationApp:
         self._last_costes_curve_t = np.array([])
         self._last_costes_curve_r = np.array([])
         self._roi_overlay_after_id = None
+        self._controls_win: tk.Toplevel | None = None
 
         self._build_ui()
+        self.root.after(0, self._ensure_window_visible)
+        self.root.after(0, self._position_controls_window)
+
+    def _set_initial_window_geometry(self):
+        """Choose a default size that fits the current display and center it."""
+        screen_w = int(self.root.winfo_screenwidth())
+        screen_h = int(self.root.winfo_screenheight())
+
+        # Keep margins so title bar and edges remain visible on smaller screens.
+        target_w = min(1320, max(980, screen_w - 80))
+        target_h = min(820, max(680, screen_h - 120))
+
+        x = max(0, (screen_w - target_w) // 2)
+        y = max(0, (screen_h - target_h) // 2)
+        self.root.geometry(f"{target_w}x{target_h}+{x}+{y}")
+
+        # Keep usability while allowing narrower displays than before.
+        self.root.minsize(980, 680)
+
+    def _ensure_window_visible(self):
+        """Clamp the mapped window to the visible screen so toolbar is never clipped."""
+        self.root.update_idletasks()
+
+        screen_w = int(self.root.winfo_screenwidth())
+        screen_h = int(self.root.winfo_screenheight())
+        w = int(self.root.winfo_width())
+        h = int(self.root.winfo_height())
+        x = int(self.root.winfo_x())
+        y = int(self.root.winfo_y())
+
+        max_x = max(0, screen_w - w)
+        max_y = max(0, screen_h - h)
+        clamped_x = min(max(x, 0), max_x)
+        clamped_y = min(max(y, 0), max_y)
+
+        if clamped_x != x or clamped_y != y:
+            self.root.geometry(f"{w}x{h}+{clamped_x}+{clamped_y}")
+
+    def _position_controls_window(self):
+        """Position the controls window near the main window and keep it visible."""
+        if self._controls_win is None or not self._controls_win.winfo_exists():
+            return
+
+        self.root.update_idletasks()
+        self._controls_win.update_idletasks()
+
+        screen_w = int(self.root.winfo_screenwidth())
+        screen_h = int(self.root.winfo_screenheight())
+
+        main_x = int(self.root.winfo_x())
+        main_y = int(self.root.winfo_y())
+        main_w = int(self.root.winfo_width())
+
+        cw_w = int(self._controls_win.winfo_width())
+        cw_h = int(self._controls_win.winfo_height())
+
+        x = main_x + max(0, (main_w - cw_w) // 2)
+        y = max(0, main_y + 24)
+
+        x = min(max(0, x), max(0, screen_w - cw_w))
+        y = min(max(0, y), max(0, screen_h - cw_h))
+        self._controls_win.geometry(f"+{x}+{y}")
 
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._apply_theme()
-
-        # ── toolbar ────────────────────────────────────────────────────────────
-        tb = ttk.Frame(self.root, padding=6)
-        tb.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Button(tb, text="Load Channel 1",  command=self.load_ch1).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tb, text="Load Channel 2",  command=self.load_ch2).pack(side=tk.LEFT, padx=3)
-        self._demo_preset_var = tk.StringVar(value="Partial overlap")
-        self._demo_preset_box = ttk.Combobox(
-            tb,
-            textvariable=self._demo_preset_var,
-            values=list(self._demo_presets.keys()),
-            state="readonly",
-            width=18,
-        )
-        self._demo_preset_box.pack(side=tk.LEFT, padx=(12, 3))
-        ttk.Button(tb, text="Load Demo Set", command=self.load_demo_set).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tb, text="Export Demo TIFFs", command=self.export_demo_set).pack(side=tk.LEFT, padx=3)
-        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Label(tb, text="ROI mode:").pack(side=tk.LEFT, padx=(4, 3))
-        self._roi_mode_box = ttk.Combobox(
-            tb,
-            textvariable=self._roi_mode_var,
-            values=["Rectangle", "Lasso"],
-            state="readonly",
-            width=11,
-        )
-        self._roi_mode_box.pack(side=tk.LEFT, padx=(0, 6))
-        self._roi_mode_box.bind("<<ComboboxSelected>>", self._on_roi_mode_change)
-        self._roi_btn = ttk.Button(
-            tb,
-            text="Cancel ROI" if self._roi_active else "Draw ROI",
-            command=self.toggle_roi,
-        )
-        self._roi_btn.pack(side=tk.LEFT, padx=3)
-        ttk.Button(tb, text="Clear ROI", command=self.clear_roi).pack(side=tk.LEFT, padx=3)
-        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(tb, text="Run Costes + Analyze", command=self.run_analysis).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tb, text="Save PDF Summary", command=self.save_pdf_summary).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tb, text="Quit", command=self.root.destroy).pack(side=tk.LEFT, padx=3)
-
-        self._status = tk.StringVar(value="Load two single-channel images to begin.")
-        ttk.Label(tb, textvariable=self._status, foreground=GRAY).pack(side=tk.RIGHT, padx=10)
+        self._build_controls_window()
 
         # ── main paned layout ──────────────────────────────────────────────────
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -178,6 +198,74 @@ class ColocalizationApp:
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
         self._build_right_panel(right)
+
+    def _build_controls_window(self):
+        """Build a compact secondary window containing all menu controls."""
+        win = tk.Toplevel(self.root)
+        self._controls_win = win
+        win.title("Analyzer Controls")
+        win.configure(bg=BG2)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self.root.destroy)
+
+        outer = ttk.Frame(win, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self._demo_preset_var = tk.StringVar(value="Partial overlap")
+        self._status = tk.StringVar(value="Load two single-channel images to begin.")
+
+        # Row 0
+        ttk.Button(outer, text="Load Channel 1", command=self.load_ch1, width=16).grid(row=0, column=0, padx=3, pady=2)
+        ttk.Button(outer, text="Load Channel 2", command=self.load_ch2, width=16).grid(row=0, column=1, padx=3, pady=2)
+        self._demo_preset_box = ttk.Combobox(
+            outer,
+            textvariable=self._demo_preset_var,
+            values=list(self._demo_presets.keys()),
+            state="readonly",
+            width=20,
+        )
+        self._demo_preset_box.grid(row=0, column=2, padx=3, pady=2)
+        ttk.Button(outer, text="Load Demo Set", command=self.load_demo_set, width=14).grid(row=0, column=3, padx=3, pady=2)
+        ttk.Button(outer, text="Export Demo TIFFs", command=self.export_demo_set, width=16).grid(row=0, column=4, padx=3, pady=2)
+
+        # Row 1
+        ttk.Label(outer, text="ROI mode:").grid(row=1, column=0, padx=(3, 1), pady=2, sticky=tk.E)
+        self._roi_mode_box = ttk.Combobox(
+            outer,
+            textvariable=self._roi_mode_var,
+            values=["Rectangle", "Lasso"],
+            state="readonly",
+            width=12,
+        )
+        self._roi_mode_box.grid(row=1, column=1, padx=3, pady=2, sticky=tk.W)
+        self._roi_mode_box.bind("<<ComboboxSelected>>", self._on_roi_mode_change)
+        self._roi_btn = ttk.Button(
+            outer,
+            text="Cancel ROI" if self._roi_active else "Draw ROI",
+            command=self.toggle_roi,
+            width=14,
+        )
+        self._roi_btn.grid(row=1, column=2, padx=3, pady=2, sticky=tk.W)
+        ttk.Button(outer, text="Clear ROI", command=self.clear_roi, width=12).grid(row=1, column=3, padx=3, pady=2)
+        ttk.Button(outer, text="Run Costes + Analyze", command=self.run_analysis, width=18).grid(row=1, column=4, padx=3, pady=2)
+
+        # Row 2
+        ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18).grid(row=2, column=3, padx=3, pady=2)
+        ttk.Button(outer, text="Quit", command=self.root.destroy, width=10).grid(row=2, column=4, padx=3, pady=2)
+
+        ttk.Separator(outer, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=5, sticky=tk.EW, pady=(4, 3))
+        ttk.Label(outer, textvariable=self._status, foreground=GRAY).grid(
+            row=4, column=0, columnspan=5, sticky=tk.W, padx=2, pady=(0, 2)
+        )
+
+        for col in range(5):
+            outer.columnconfigure(col, weight=1)
+
+        win.update_idletasks()
+        w = max(900, int(win.winfo_reqwidth()) + 8)
+        h = int(win.winfo_reqheight()) + 8
+        win.geometry(f"{w}x{h}")
 
     def _apply_theme(self):
         style = ttk.Style()
