@@ -44,7 +44,7 @@ from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import LassoSelector, RectangleSelector
 
-from scipy import stats
+from scipy import stats, ndimage
 
 # ── optional image-loading libraries ──────────────────────────────────────────
 try:
@@ -116,6 +116,9 @@ class ColocalizationApp:
         self._last_costes_curve_r = np.array([])
         self._roi_overlay_after_id = None
         self._controls_win: tk.Toplevel | None = None
+        self._tooltip_win: tk.Toplevel | None = None
+        self._tooltip_after_id = None
+        self._despike_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -216,8 +219,14 @@ class ColocalizationApp:
         self._status = tk.StringVar(value="Load two single-channel images to begin.")
 
         # Row 0
-        ttk.Button(outer, text="Load Channel 1", command=self.load_ch1, width=16).grid(row=0, column=0, padx=3, pady=2)
-        ttk.Button(outer, text="Load Channel 2", command=self.load_ch2, width=16).grid(row=0, column=1, padx=3, pady=2)
+        btn_load_ch1 = ttk.Button(outer, text="Load Channel 1", command=self.load_ch1, width=16)
+        btn_load_ch1.grid(row=0, column=0, padx=3, pady=2)
+        self._attach_tooltip(btn_load_ch1, "Open grayscale image for channel 1")
+
+        btn_load_ch2 = ttk.Button(outer, text="Load Channel 2", command=self.load_ch2, width=16)
+        btn_load_ch2.grid(row=0, column=1, padx=3, pady=2)
+        self._attach_tooltip(btn_load_ch2, "Open grayscale image for channel 2")
+
         self._demo_preset_box = ttk.Combobox(
             outer,
             textvariable=self._demo_preset_var,
@@ -226,20 +235,40 @@ class ColocalizationApp:
             width=20,
         )
         self._demo_preset_box.grid(row=0, column=2, padx=3, pady=2)
-        ttk.Button(outer, text="Load Demo Set", command=self.load_demo_set, width=14).grid(row=0, column=3, padx=3, pady=2)
-        ttk.Button(outer, text="Export Demo TIFFs", command=self.export_demo_set, width=16).grid(row=0, column=4, padx=3, pady=2)
+        self._attach_tooltip(self._demo_preset_box, "Select a synthetic demo scenario")
+
+        btn_demo_load = ttk.Button(outer, text="Load Demo Set", command=self.load_demo_set, width=14)
+        btn_demo_load.grid(row=0, column=3, padx=3, pady=2)
+        self._attach_tooltip(btn_demo_load, "Generate and load demo channels")
+
+        btn_demo_export = ttk.Button(outer, text="Export Demo TIFFs", command=self.export_demo_set, width=16)
+        btn_demo_export.grid(row=0, column=4, padx=3, pady=2)
+        self._attach_tooltip(btn_demo_export, "Save demo channels as TIFF files")
 
         # Row 1
         ttk.Label(outer, text="ROI mode:").grid(row=1, column=0, padx=(3, 1), pady=2, sticky=tk.E)
-        self._roi_mode_box = ttk.Combobox(
-            outer,
-            textvariable=self._roi_mode_var,
-            values=["Rectangle", "Lasso"],
-            state="readonly",
-            width=12,
+        roi_mode_frame = ttk.Frame(outer)
+        roi_mode_frame.grid(row=1, column=1, padx=3, pady=2, sticky=tk.W)
+        rb_rect = ttk.Radiobutton(
+            roi_mode_frame,
+            text="Rectangle",
+            value="Rectangle",
+            variable=self._roi_mode_var,
+            command=self._on_roi_mode_change,
         )
-        self._roi_mode_box.grid(row=1, column=1, padx=3, pady=2, sticky=tk.W)
-        self._roi_mode_box.bind("<<ComboboxSelected>>", self._on_roi_mode_change)
+        rb_rect.pack(side=tk.LEFT, padx=(0, 8))
+        self._attach_tooltip(rb_rect, "Use rectangular ROI with resize handles")
+
+        rb_lasso = ttk.Radiobutton(
+            roi_mode_frame,
+            text="Lasso",
+            value="Lasso",
+            variable=self._roi_mode_var,
+            command=self._on_roi_mode_change,
+        )
+        rb_lasso.pack(side=tk.LEFT)
+        self._attach_tooltip(rb_lasso, "Use freehand ROI drawing")
+
         self._roi_btn = ttk.Button(
             outer,
             text="Cancel ROI" if self._roi_active else "Draw ROI",
@@ -247,12 +276,33 @@ class ColocalizationApp:
             width=14,
         )
         self._roi_btn.grid(row=1, column=2, padx=3, pady=2, sticky=tk.W)
-        ttk.Button(outer, text="Clear ROI", command=self.clear_roi, width=12).grid(row=1, column=3, padx=3, pady=2)
-        ttk.Button(outer, text="Run Costes + Analyze", command=self.run_analysis, width=18).grid(row=1, column=4, padx=3, pady=2)
+        self._attach_tooltip(self._roi_btn, "Enable or disable ROI drawing")
+
+        btn_clear_roi = ttk.Button(outer, text="Clear ROI", command=self.clear_roi, width=12)
+        btn_clear_roi.grid(row=1, column=3, padx=3, pady=2)
+        self._attach_tooltip(btn_clear_roi, "Remove ROI and use full image")
+
+        btn_run = ttk.Button(outer, text="Run Costes + Analyze", command=self.run_analysis, width=18)
+        btn_run.configure(style="Analyze.TButton")
+        btn_run.grid(row=1, column=4, padx=3, pady=2)
+        self._attach_tooltip(btn_run, "Compute thresholds and colocalization metrics")
 
         # Row 2
-        ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18).grid(row=2, column=3, padx=3, pady=2)
-        ttk.Button(outer, text="Quit", command=self.root.destroy, width=10).grid(row=2, column=4, padx=3, pady=2)
+        cb_despike = ttk.Checkbutton(
+            outer,
+            text="Preprocess hot pixels",
+            variable=self._despike_var,
+        )
+        cb_despike.grid(row=2, column=0, columnspan=3, padx=3, pady=2, sticky=tk.W)
+        self._attach_tooltip(cb_despike, "Replace isolated bright outliers with local median")
+
+        btn_pdf = ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18)
+        btn_pdf.grid(row=2, column=3, padx=3, pady=2)
+        self._attach_tooltip(btn_pdf, "Export current plots and metrics to PDF")
+
+        btn_quit = ttk.Button(outer, text="Quit", command=self.root.destroy, width=10)
+        btn_quit.grid(row=2, column=4, padx=3, pady=2)
+        self._attach_tooltip(btn_quit, "Close the application")
 
         ttk.Separator(outer, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=5, sticky=tk.EW, pady=(4, 3))
         ttk.Label(outer, textvariable=self._status, foreground=GRAY).grid(
@@ -266,6 +316,58 @@ class ColocalizationApp:
         w = max(900, int(win.winfo_reqwidth()) + 8)
         h = int(win.winfo_reqheight()) + 8
         win.geometry(f"{w}x{h}")
+
+    def _attach_tooltip(self, widget, text: str):
+        """Attach a short hover tooltip to a Tk/ttk widget."""
+        widget.bind("<Enter>", lambda e: self._schedule_tooltip(widget, text), add="+")
+        widget.bind("<Leave>", lambda e: self._hide_tooltip(), add="+")
+        widget.bind("<ButtonPress>", lambda e: self._hide_tooltip(), add="+")
+
+    def _schedule_tooltip(self, widget, text: str):
+        if self._tooltip_after_id is not None:
+            try:
+                self.root.after_cancel(self._tooltip_after_id)
+            except tk.TclError:
+                pass
+        self._tooltip_after_id = self.root.after(
+            350, lambda: self._show_tooltip(widget, text)
+        )
+
+    def _show_tooltip(self, widget, text: str):
+        self._tooltip_after_id = None
+        if not widget.winfo_exists():
+            return
+
+        self._hide_tooltip()
+        tw = tk.Toplevel(self.root)
+        self._tooltip_win = tw
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+
+        label = ttk.Label(tw, text=text, background="#111122", foreground=FG, padding=(6, 3))
+        label.pack()
+
+        tw.update_idletasks()
+        x = widget.winfo_rootx() + 10
+        y = widget.winfo_rooty() + widget.winfo_height() + 6
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        ww = tw.winfo_width()
+        wh = tw.winfo_height()
+        x = min(max(0, x), max(0, sw - ww))
+        y = min(max(0, y), max(0, sh - wh))
+        tw.geometry(f"+{x}+{y}")
+
+    def _hide_tooltip(self):
+        if self._tooltip_after_id is not None:
+            try:
+                self.root.after_cancel(self._tooltip_after_id)
+            except tk.TclError:
+                pass
+            self._tooltip_after_id = None
+        if self._tooltip_win is not None and self._tooltip_win.winfo_exists():
+            self._tooltip_win.destroy()
+        self._tooltip_win = None
 
     def _apply_theme(self):
         style = ttk.Style()
@@ -285,6 +387,20 @@ class ColocalizationApp:
         style.map("TNotebook.Tab",           background=[("selected", BG2)], foreground=[("selected", YELLOW)])
         style.configure("TScale",            background=BG2)
         style.configure("TSeparator",        background=GRAY)
+
+        # Emphasized action button for starting analysis.
+        style.configure(
+            "Analyze.TButton",
+            background="#2f7d4a",
+            foreground="#f3fff3",
+            padding=5,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+        style.map(
+            "Analyze.TButton",
+            background=[("active", "#3f965c")],
+            foreground=[("active", "#ffffff")],
+        )
 
     def _build_image_panel(self, parent):
         fig, axes = plt.subplots(1, 2, figsize=(7, 4), facecolor=BG2)
@@ -1032,7 +1148,29 @@ class ColocalizationApp:
 
     # ── data extraction ────────────────────────────────────────────────────────
 
-    def _get_roi_arrays(self):
+    @staticmethod
+    def _despike_hot_pixels(img: np.ndarray) -> np.ndarray:
+        """Suppress isolated bright outliers using a conservative 3x3 local test."""
+        if img.size == 0:
+            return img
+
+        med = ndimage.median_filter(img, size=3, mode="reflect")
+        diff = img - med
+        local_mad = ndimage.median_filter(np.abs(diff), size=3, mode="reflect")
+
+        p1, p99 = np.percentile(img, [1.0, 99.0])
+        robust_range = max(float(p99 - p1), 1.0)
+        threshold = (6.0 * local_mad) + (0.02 * robust_range)
+        mask = diff > threshold
+
+        if not np.any(mask):
+            return img
+
+        out = img.copy()
+        out[mask] = med[mask]
+        return out
+
+    def _get_roi_arrays(self, preprocess: bool = False):
         if self.ch1 is None or self.ch2 is None:
             return None, None
         if self.ch1.shape[:2] != self.ch2.shape[:2]:
@@ -1049,9 +1187,14 @@ class ColocalizationApp:
         else:
             c1 = self.ch1
             c2 = self.ch2
+
+        if preprocess and self._despike_var.get():
+            c1 = self._despike_hot_pixels(c1)
+            c2 = self._despike_hot_pixels(c2)
+
         return c1, c2
 
-    def _get_pixels(self):
+    def _get_pixels(self, preprocess: bool = False):
         if self.ch1 is None or self.ch2 is None:
             return None, None
         if self.ch1.shape[:2] != self.ch2.shape[:2]:
@@ -1063,10 +1206,15 @@ class ColocalizationApp:
             return None, None
 
         if self._roi_kind == "lasso" and self.roi_mask is not None:
-            c1 = self.ch1[self.roi_mask]
-            c2 = self.ch2[self.roi_mask]
+            c1_img = self.ch1
+            c2_img = self.ch2
+            if preprocess and self._despike_var.get():
+                c1_img = self._despike_hot_pixels(c1_img)
+                c2_img = self._despike_hot_pixels(c2_img)
+            c1 = c1_img[self.roi_mask]
+            c2 = c2_img[self.roi_mask]
         else:
-            c1_img, c2_img = self._get_roi_arrays()
+            c1_img, c2_img = self._get_roi_arrays(preprocess=preprocess)
             if c1_img is None:
                 return None, None
             c1 = c1_img.ravel()
@@ -1293,7 +1441,20 @@ class ColocalizationApp:
     # ── analysis entry point ───────────────────────────────────────────────────
 
     def run_analysis(self):
-        c1, c2 = self._get_pixels()
+        use_preprocess = self._despike_var.get()
+
+        if self._roi_kind == "lasso":
+            c1, c2 = self._get_pixels(preprocess=use_preprocess)
+            c1_img = None
+            c2_img = None
+        else:
+            c1_img, c2_img = self._get_roi_arrays(preprocess=use_preprocess)
+            if c1_img is None:
+                messagebox.showwarning("Missing data", "Load both channel images first.")
+                return
+            c1 = c1_img.ravel()
+            c2 = c2_img.ravel()
+
         if c1 is None:
             messagebox.showwarning("Missing data", "Load both channel images first.")
             return
@@ -1326,7 +1487,6 @@ class ColocalizationApp:
                 n_iter=0,
             )
         else:
-            c1_img, c2_img = self._get_roi_arrays()
             self._status.set("Running Costes randomization…")
             self.root.update_idletasks()
             rand = self.costes_randomization(
@@ -1370,6 +1530,7 @@ class ColocalizationApp:
             f"Done  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
             f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  |  "
             f"Costes sig={rand['significance']:.1f}%"
+            + ("  |  hot-pixel preprocess ON" if use_preprocess else "")
             + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
         )
 
@@ -1388,7 +1549,7 @@ class ColocalizationApp:
         self._t2_entry_var.set(f"{t2:.1f}")
         self._rv["costes_t1"].set(f"{t1:.2f}")
         self._rv["costes_t2"].set(f"{t2:.2f}")
-        c1, c2 = self._get_pixels()
+        c1, c2 = self._get_pixels(preprocess=self._despike_var.get())
         if c1 is None:
             return
         res = self.manders(c1, c2, t1, t2)
