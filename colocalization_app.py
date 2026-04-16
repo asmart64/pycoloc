@@ -40,8 +40,9 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Rectangle
-from matplotlib.widgets import RectangleSelector
+from matplotlib.patches import Polygon, Rectangle
+from matplotlib.path import Path as MplPath
+from matplotlib.widgets import LassoSelector, RectangleSelector
 
 from scipy import stats
 
@@ -97,6 +98,10 @@ class ColocalizationApp:
         self.ch1: np.ndarray | None = None
         self.ch2: np.ndarray | None = None
         self.roi: tuple | None = None          # (x1, y1, x2, y2) pixel coords
+        self.roi_polygon: np.ndarray | None = None
+        self.roi_mask: np.ndarray | None = None
+        self._roi_kind: str | None = None
+        self._roi_mode_var = tk.StringVar(value="Rectangle")
         self._roi_active = True
         self._demo_presets = {
             "High overlap": "Strongly shared puncta with mild independent signal.",
@@ -137,6 +142,16 @@ class ColocalizationApp:
         ttk.Button(tb, text="Load Demo Set", command=self.load_demo_set).pack(side=tk.LEFT, padx=3)
         ttk.Button(tb, text="Export Demo TIFFs", command=self.export_demo_set).pack(side=tk.LEFT, padx=3)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(tb, text="ROI mode:").pack(side=tk.LEFT, padx=(4, 3))
+        self._roi_mode_box = ttk.Combobox(
+            tb,
+            textvariable=self._roi_mode_var,
+            values=["Rectangle", "Lasso"],
+            state="readonly",
+            width=11,
+        )
+        self._roi_mode_box.pack(side=tk.LEFT, padx=(0, 6))
+        self._roi_mode_box.bind("<<ComboboxSelected>>", self._on_roi_mode_change)
         self._roi_btn = ttk.Button(
             tb,
             text="Cancel ROI" if self._roi_active else "Draw ROI",
@@ -211,7 +226,33 @@ class ColocalizationApp:
             # older matplotlib – no 'props' kwarg
             rs_kwargs.pop("props", None)
             self._roi_sel = RectangleSelector(axes[0], self._on_roi_select, **rs_kwargs)
-        self._roi_sel.set_active(self._roi_active)
+
+        # Lasso selector for freehand ROI drawing.
+        lasso_kwargs = dict(useblit=True, button=[1])
+        try:
+            lasso_kwargs["props"] = dict(color=YELLOW, alpha=0.9, linewidth=1.5)
+            self._lasso_sel = LassoSelector(axes[0], self._on_lasso_select, **lasso_kwargs)
+        except TypeError:
+            lasso_kwargs.pop("props", None)
+            lasso_kwargs["lineprops"] = dict(color=YELLOW, alpha=0.9, linewidth=1.5)
+            self._lasso_sel = LassoSelector(axes[0], self._on_lasso_select, **lasso_kwargs)
+
+        self._set_roi_selector_active()
+
+    def _set_roi_selector_active(self):
+        """Activate only the selector matching the currently selected ROI mode."""
+        mode = self._roi_mode_var.get()
+        rect_on = self._roi_active and mode == "Rectangle"
+        lasso_on = self._roi_active and mode == "Lasso"
+        self._roi_sel.set_active(rect_on)
+        self._lasso_sel.set_active(lasso_on)
+
+    def _on_roi_mode_change(self, _event=None):
+        self._set_roi_selector_active()
+        if self._roi_active:
+            self._status.set(
+                f"ROI mode set to {self._roi_mode_var.get()}. Draw on Channel-1 image."
+            )
 
     def _build_right_panel(self, parent):
         nb = ttk.Notebook(parent)
@@ -488,6 +529,9 @@ class ColocalizationApp:
         self.ch1 = ch1
         self.ch2 = ch2
         self.roi = None
+        self.roi_polygon = None
+        self.roi_mask = None
+        self._roi_kind = None
         self._refresh_images()
         self._sync_slider_range()
 
@@ -764,15 +808,23 @@ class ColocalizationApp:
         if self.roi is not None:
             x1, y1, x2, y2 = self.roi
             # Channel 1 ROI is shown by the live RectangleSelector when active.
-            if not self._roi_active:
+            if self._roi_kind == "rect" and not self._roi_active:
                 ax0.add_patch(Rectangle(
                     (x1, y1), x2 - x1, y2 - y1,
                     linewidth=2, edgecolor=YELLOW, facecolor="none",
                 ))
-            ax1.add_patch(Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                linewidth=2, edgecolor=YELLOW, facecolor="none",
-            ))
+            if self._roi_kind == "rect":
+                ax1.add_patch(Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=2, edgecolor=YELLOW, facecolor="none",
+                ))
+
+        if self._roi_kind == "lasso" and self.roi_polygon is not None:
+            poly = Polygon(self.roi_polygon, closed=True, fill=False,
+                           edgecolor=YELLOW, linewidth=2)
+            ax0.add_patch(poly)
+            ax1.add_patch(Polygon(self.roi_polygon, closed=True, fill=False,
+                                  edgecolor=YELLOW, linewidth=2))
 
         for ax in self._img_axes:
             ax.axis("off")
@@ -786,12 +838,14 @@ class ColocalizationApp:
             messagebox.showwarning("No image", "Load Channel 1 first.")
             return
         self._roi_active = not self._roi_active
-        self._roi_sel.set_active(self._roi_active)
+        self._set_roi_selector_active()
         self._roi_btn.config(
             text="Cancel ROI" if self._roi_active else "Draw ROI"
         )
         if self._roi_active:
-            self._status.set("Click and drag on the Channel-1 image to draw ROI.")
+            self._status.set(
+                f"{self._roi_mode_var.get()} ROI active: draw on the Channel-1 image."
+            )
 
     def _on_roi_select(self, eclick, erelease):
         if eclick.xdata is None or erelease.xdata is None:
@@ -804,9 +858,12 @@ class ColocalizationApp:
             y1 = max(0, int(y1)); y2 = min(h, int(y2))
         if (x2 - x1) > 5 and (y2 - y1) > 5:
             self.roi = (x1, y1, x2, y2)
+            self.roi_polygon = None
+            self.roi_mask = None
+            self._roi_kind = "rect"
             # Keep the selector active so the ROI remains editable via handles.
             self._roi_active = True
-            self._roi_sel.set_active(True)
+            self._set_roi_selector_active()
             self._roi_sel.extents = (x1, x2, y1, y2)
             self._roi_btn.config(text="Cancel ROI")
             self._schedule_secondary_roi_overlay()
@@ -815,10 +872,46 @@ class ColocalizationApp:
             f"ROI: x=[{x1}, {x2}], y=[{y1}, {y2}]  —  Drag handles to refine or click 'Run Costes + Analyze'."
         )
 
+    def _on_lasso_select(self, verts):
+        if self.ch1 is None or self.ch2 is None:
+            return
+        if len(verts) < 3:
+            return
+
+        h, w = self.ch1.shape[:2]
+        pts = np.asarray(verts, dtype=np.float64)
+        path = MplPath(pts)
+
+        yy, xx = np.mgrid[0:h, 0:w]
+        pix = np.column_stack((xx.ravel(), yy.ravel()))
+        mask = path.contains_points(pix).reshape(h, w)
+        n_sel = int(mask.sum())
+        if n_sel < 25:
+            self._status.set("Lasso ROI too small. Draw a larger area.")
+            return
+
+        self.roi_polygon = pts
+        self.roi_mask = mask
+        self._roi_kind = "lasso"
+
+        ys, xs = np.where(mask)
+        self.roi = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+        self._roi_active = True
+        self._set_roi_selector_active()
+        self._roi_btn.config(text="Cancel ROI")
+        self._refresh_images()
+        self._status.set(
+            f"Lasso ROI selected ({n_sel} pixels). Click 'Run Costes + Analyze'."
+        )
+
     def clear_roi(self):
         self.roi = None
+        self.roi_polygon = None
+        self.roi_mask = None
+        self._roi_kind = None
         self._roi_sel.clear()
-        self._roi_sel.set_active(self._roi_active)
+        self._set_roi_selector_active()
         self._refresh_images()
         self._update_secondary_roi_overlay()
         self._status.set("ROI cleared — full image will be used.")
@@ -838,12 +931,15 @@ class ColocalizationApp:
         ax1 = self._img_axes[1]
         for p in list(ax1.patches):
             p.remove()
-        if self.roi is not None:
+        if self._roi_kind == "rect" and self.roi is not None:
             x1, y1, x2, y2 = self.roi
             ax1.add_patch(Rectangle(
                 (x1, y1), x2 - x1, y2 - y1,
                 linewidth=2, edgecolor=YELLOW, facecolor="none",
             ))
+        elif self._roi_kind == "lasso" and self.roi_polygon is not None:
+            ax1.add_patch(Polygon(self.roi_polygon, closed=True, fill=False,
+                                  edgecolor=YELLOW, linewidth=2))
         self._img_canvas.draw_idle()
 
     # ── data extraction ────────────────────────────────────────────────────────
@@ -858,7 +954,7 @@ class ColocalizationApp:
                 f"Ch1: {self.ch1.shape}   Ch2: {self.ch2.shape}",
             )
             return None, None
-        if self.roi:
+        if self.roi and self._roi_kind == "rect":
             x1, y1, x2, y2 = self.roi
             c1 = self.ch1[y1:y2, x1:x2]
             c2 = self.ch2[y1:y2, x1:x2]
@@ -868,11 +964,25 @@ class ColocalizationApp:
         return c1, c2
 
     def _get_pixels(self):
-        c1_img, c2_img = self._get_roi_arrays()
-        if c1_img is None:
+        if self.ch1 is None or self.ch2 is None:
             return None, None
-        c1 = c1_img.ravel()
-        c2 = c2_img.ravel()
+        if self.ch1.shape[:2] != self.ch2.shape[:2]:
+            messagebox.showerror(
+                "Shape mismatch",
+                "Both channels must have identical spatial dimensions.\n"
+                f"Ch1: {self.ch1.shape}   Ch2: {self.ch2.shape}",
+            )
+            return None, None
+
+        if self._roi_kind == "lasso" and self.roi_mask is not None:
+            c1 = self.ch1[self.roi_mask]
+            c2 = self.ch2[self.roi_mask]
+        else:
+            c1_img, c2_img = self._get_roi_arrays()
+            if c1_img is None:
+                return None, None
+            c1 = c1_img.ravel()
+            c2 = c2_img.ravel()
         return c1, c2
 
     # ── Costes algorithm ───────────────────────────────────────────────────────
@@ -1095,12 +1205,10 @@ class ColocalizationApp:
     # ── analysis entry point ───────────────────────────────────────────────────
 
     def run_analysis(self):
-        c1_img, c2_img = self._get_roi_arrays()
-        if c1_img is None:
+        c1, c2 = self._get_pixels()
+        if c1 is None:
             messagebox.showwarning("Missing data", "Load both channel images first.")
             return
-        c1 = c1_img.ravel()
-        c2 = c2_img.ravel()
 
         self._status.set("Running Costes algorithm…")
         self.root.update_idletasks()
@@ -1111,13 +1219,33 @@ class ColocalizationApp:
         self._last_costes_curve_t = curve_t
         self._last_costes_curve_r = curve_r
         res = self.manders(c1, c2, t1, t2)
-        self._status.set("Running Costes randomization…")
-        self.root.update_idletasks()
-        rand = self.costes_randomization(
-            c1_img,
-            c2_img,
-            block_size=self._get_psf_block_size(),
-        )
+        if self._roi_kind == "lasso":
+            # Costes randomization operates on rectangular image tiles.
+            messagebox.showwarning(
+                "Costes randomization unavailable",
+                "Costes randomization is disabled for lasso ROI because it "
+                "relies on block shuffling of rectangular image tiles. "
+                "A freehand ROI is a non-rectangular mask, so block-wise "
+                "spatial randomization is not well-defined in this mode."
+            )
+            rand = dict(
+                observed_r=float("nan"),
+                random_mean=float("nan"),
+                random_std=float("nan"),
+                significance=float("nan"),
+                p_value=float("nan"),
+                block_size=0,
+                n_iter=0,
+            )
+        else:
+            c1_img, c2_img = self._get_roi_arrays()
+            self._status.set("Running Costes randomization…")
+            self.root.update_idletasks()
+            rand = self.costes_randomization(
+                c1_img,
+                c2_img,
+                block_size=self._get_psf_block_size(),
+            )
 
         # update threshold entry fields
         self._t1_entry_var.set(f"{t1:.1f}")
@@ -1154,6 +1282,7 @@ class ColocalizationApp:
             f"Done  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
             f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  |  "
             f"Costes sig={rand['significance']:.1f}%"
+            + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
         )
 
     def _slider_update(self, _=None, draw_plots: bool = True):
@@ -1349,7 +1478,12 @@ class ColocalizationApp:
         if not out_path.lower().endswith(".pdf"):
             out_path += ".pdf"
 
-        if self.roi is None:
+        if self._roi_kind == "lasso" and self.roi_mask is not None and self.roi is not None:
+            x1, y1, x2, y2 = self.roi
+            roi_text = (
+                f"Lasso ({int(self.roi_mask.sum())} px), bbox: x=[{x1}, {x2}], y=[{y1}, {y2}]"
+            )
+        elif self.roi is None:
             roi_text = "Full image"
         else:
             x1, y1, x2, y2 = self.roi
