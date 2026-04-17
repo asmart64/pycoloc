@@ -125,6 +125,7 @@ class ColocalizationApp:
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
         self.root.after(0, self._position_controls_window)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_initial_window_geometry(self):
         """Choose a default size that fits the current display and center it."""
@@ -212,7 +213,7 @@ class ColocalizationApp:
         win.configure(bg=BG2)
         win.resizable(False, False)
         win.transient(self.root)
-        win.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        win.protocol("WM_DELETE_WINDOW", self._on_close)
 
         outer = ttk.Frame(win, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -311,7 +312,7 @@ class ColocalizationApp:
         btn_pdf.grid(row=2, column=3, padx=3, pady=2)
         self._attach_tooltip(btn_pdf, "Export current plots and metrics to PDF")
 
-        btn_quit = ttk.Button(outer, text="Quit", command=self.root.destroy, width=10)
+        btn_quit = ttk.Button(outer, text="Quit", command=self._on_close, width=10)
         btn_quit.grid(row=2, column=4, padx=3, pady=2)
         self._attach_tooltip(btn_quit, "Close the application")
 
@@ -379,6 +380,35 @@ class ColocalizationApp:
         if self._tooltip_win is not None and self._tooltip_win.winfo_exists():
             self._tooltip_win.destroy()
         self._tooltip_win = None
+
+    def _on_close(self):
+        """Close app safely by canceling scheduled callbacks first."""
+        if self._tooltip_after_id is not None:
+            try:
+                self.root.after_cancel(self._tooltip_after_id)
+            except tk.TclError:
+                pass
+            self._tooltip_after_id = None
+
+        if self._roi_overlay_after_id is not None:
+            try:
+                self.root.after_cancel(self._roi_overlay_after_id)
+            except tk.TclError:
+                pass
+            self._roi_overlay_after_id = None
+
+        self._hide_tooltip()
+
+        try:
+            if self._controls_win is not None and self._controls_win.winfo_exists():
+                self._controls_win.destroy()
+        except tk.TclError:
+            pass
+
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _apply_theme(self):
         style = ttk.Style()
