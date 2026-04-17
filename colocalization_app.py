@@ -383,6 +383,11 @@ class ColocalizationApp:
 
     def _on_close(self):
         """Close app safely by canceling scheduled callbacks first."""
+        # Guard against re-entrant close events fired by multiple windows.
+        if getattr(self, "_is_closing", False):
+            return
+        self._is_closing = True
+
         if self._tooltip_after_id is not None:
             try:
                 self.root.after_cancel(self._tooltip_after_id)
@@ -402,6 +407,17 @@ class ColocalizationApp:
         try:
             if self._controls_win is not None and self._controls_win.winfo_exists():
                 self._controls_win.destroy()
+        except tk.TclError:
+            pass
+
+        # Ensure no Matplotlib/Tk resources keep the process alive.
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+        try:
+            self.root.quit()
         except tk.TclError:
             pass
 
