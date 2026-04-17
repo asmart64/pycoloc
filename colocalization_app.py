@@ -145,6 +145,7 @@ class ColocalizationApp:
         self._tooltip_after_id = None
         self._despike_var = tk.BooleanVar(value=False)
         self._autostretch_var = tk.BooleanVar(value=False)
+        self._orthreg_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -377,17 +378,31 @@ class ColocalizationApp:
         cb_autostretch.grid(row=2, column=2, padx=3, pady=2, sticky=tk.W)
         self._attach_tooltip(cb_autostretch, "Enhance display contrast using robust percentiles")
 
+        # Row 3
+        cb_orthreg = ttk.Checkbutton(
+            outer,
+            text="Orthogonal regression (Costes)",
+            variable=self._orthreg_var,
+        )
+        cb_orthreg.grid(row=3, column=0, columnspan=3, padx=3, pady=2, sticky=tk.W)
+        self._attach_tooltip(
+            cb_orthreg,
+            "Use orthogonal (total least squares) regression instead of OLS "
+            "when fitting the Ch2 vs Ch1 line for Costes thresholding. "
+            "Minimises perpendicular distances rather than vertical residuals.",
+        )
+
         btn_pdf = ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18)
-        btn_pdf.grid(row=2, column=3, padx=3, pady=2)
+        btn_pdf.grid(row=3, column=3, padx=3, pady=2)
         self._attach_tooltip(btn_pdf, "Export current plots and metrics to PDF")
 
         btn_quit = ttk.Button(outer, text="Quit", command=self._on_close, width=10)
-        btn_quit.grid(row=2, column=4, padx=3, pady=2)
+        btn_quit.grid(row=3, column=4, padx=3, pady=2)
         self._attach_tooltip(btn_quit, "Close the application")
 
-        ttk.Separator(outer, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=5, sticky=tk.EW, pady=(4, 3))
+        ttk.Separator(outer, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=5, sticky=tk.EW, pady=(4, 3))
         ttk.Label(outer, textvariable=self._status, foreground=GRAY).grid(
-            row=4, column=0, columnspan=5, sticky=tk.W, padx=2, pady=(0, 2)
+            row=5, column=0, columnspan=5, sticky=tk.W, padx=2, pady=(0, 2)
         )
 
         for col in range(5):
@@ -1431,13 +1446,39 @@ class ColocalizationApp:
     # ── Costes algorithm ───────────────────────────────────────────────────────
 
     @staticmethod
-    def costes_threshold(c1: np.ndarray, c2: np.ndarray, n_steps: int = 1024):
+    def _orthogonal_regression(c1: np.ndarray, c2: np.ndarray):
+        """
+        Orthogonal (total least squares) regression of Ch2 on Ch1.
+
+        Minimises perpendicular distances to the fitted line rather than
+        vertical residuals. Equivalent to the first principal component of
+        the (c1, c2) scatter cloud, forced through the means.
+
+        Returns (slope, intercept) in the same convention as linregress.
+        """
+        x = c1.astype(np.float64)
+        y = c2.astype(np.float64)
+        mx, my = x.mean(), y.mean()
+        xc, yc = x - mx, y - my
+        # 2×2 scatter matrix
+        sxx = float((xc * xc).sum())
+        sxy = float((xc * yc).sum())
+        syy = float((yc * yc).sum())
+        # Slope from first eigenvector of the scatter matrix
+        b = (syy - sxx + np.sqrt((syy - sxx) ** 2 + 4.0 * sxy ** 2)) / (2.0 * sxy) if abs(sxy) > 1e-12 else (1.0 if syy >= sxx else 0.0)
+        a = my - b * mx
+        return float(b), float(a)
+
+    @staticmethod
+    def costes_threshold(c1: np.ndarray, c2: np.ndarray,
+                         n_steps: int = 1024,
+                         orthogonal: bool = False):
         """
         Costes automatic threshold algorithm (Costes et al., 2004).
 
         Steps
         -----
-        1. Fit linear regression  Ch2 = a·Ch1 + b  through all pixels.
+        1. Fit regression  Ch2 = a·Ch1 + b  (OLS or orthogonal, see `orthogonal`).
         2. Starting from max(Ch1) decrease T1; paired T2 = a·T1 + b.
         3. At each step compute Pearson's r for pixels BELOW the threshold
            pair: c1 < T1 AND c2 < T2.  These are the putative background
@@ -1449,14 +1490,24 @@ class ColocalizationApp:
               A minimum foreground-support rule is applied to avoid selecting a
               threshold when only a tiny high-intensity tail remains.
 
+        Parameters
+        ----------
+        orthogonal : bool
+            When True use orthogonal (total least squares) regression instead
+            of ordinary least squares.  This treats both channels symmetrically
+            and minimises perpendicular rather than vertical residuals.
+
         Returns
         -------
         t1, t2 : optimal threshold values
         slope, intercept : regression coefficients
         curve_t1, curve_r : r of below-threshold pixels at each step
         """
-        res = stats.linregress(c1, c2)
-        slope, intercept = float(res.slope), float(res.intercept)
+        if orthogonal:
+            slope, intercept = ColocalizationApp._orthogonal_regression(c1, c2)
+        else:
+            res = stats.linregress(c1, c2)
+            slope, intercept = float(res.slope), float(res.intercept)
 
         max1, min1 = float(c1.max()), float(c1.min())
         max2        = float(c2.max())
@@ -1669,7 +1720,9 @@ class ColocalizationApp:
         self._status.set("Running Costes algorithm…")
         self.root.update_idletasks()
 
-        t1, t2, slope, intercept, curve_t, curve_r = self.costes_threshold(c1, c2)
+        t1, t2, slope, intercept, curve_t, curve_r = self.costes_threshold(
+            c1, c2, orthogonal=self._orthreg_var.get()
+        )
         self._last_costes_slope = slope
         self._last_costes_intercept = intercept
         self._last_costes_curve_t = curve_t
@@ -1738,6 +1791,7 @@ class ColocalizationApp:
             f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  "
             f"tM1={res['tm1']:.3f}  tM2={res['tm2']:.3f}  |  "
             f"Costes sig={rand['significance']:.1f}%"
+            + ("  |  Orthogonal reg" if self._orthreg_var.get() else "")
             + ("  |  hot-pixel preprocess ON" if use_preprocess else "")
             + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
         )
@@ -1865,8 +1919,9 @@ class ColocalizationApp:
 
         # regression line
         xr = np.array([c1.min(), c1.max()])
+        reg_label = "Orthogonal" if self._orthreg_var.get() else "OLS"
         ax_sc.plot(xr, slope * xr + intercept, color="tomato",
-                   linewidth=1.5, label=f"Regression  a={slope:.3f}")
+                   linewidth=1.5, label=f"{reg_label} regression  a={slope:.3f}")
 
         # threshold crosshairs
         ax_sc.axvline(t1, color=CYAN,    linewidth=1.5, linestyle="--",
@@ -1982,6 +2037,7 @@ class ColocalizationApp:
                     f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     f"Image shape: {self.ch1.shape}",
                     f"ROI: {roi_text}",
+                    f"Costes regression: {'Orthogonal (TLS)' if self._orthreg_var.get() else 'Ordinary least squares'}",
                     "",
                 ]
 
