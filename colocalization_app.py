@@ -117,6 +117,7 @@ class ColocalizationApp:
         self._last_costes_curve_r = np.array([])
         self._roi_overlay_after_id = None
         self._controls_win: tk.Toplevel | None = None
+        self._images_win: tk.Toplevel | None = None
         self._tooltip_win: tk.Toplevel | None = None
         self._tooltip_after_id = None
         self._despike_var = tk.BooleanVar(value=False)
@@ -125,6 +126,7 @@ class ColocalizationApp:
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
         self.root.after(0, self._position_controls_window)
+        self.root.after(0, self._position_images_window)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_initial_window_geometry(self):
@@ -133,15 +135,16 @@ class ColocalizationApp:
         screen_h = int(self.root.winfo_screenheight())
 
         # Keep margins so title bar and edges remain visible on smaller screens.
-        target_w = min(1320, max(980, screen_w - 80))
-        target_h = min(820, max(680, screen_h - 120))
+        # Reduced width by ~40%, increased height to show all controls including manual thresholds.
+        target_w = min(660, max(560, int((screen_w - 120) * 0.60)))
+        target_h = min(900, max(640, int((screen_h - 160) * 0.90)))
 
         x = max(0, (screen_w - target_w) // 2)
         y = max(0, (screen_h - target_h) // 2)
         self.root.geometry(f"{target_w}x{target_h}+{x}+{y}")
 
-        # Keep usability while allowing narrower displays than before.
-        self.root.minsize(980, 680)
+        # Keep usability while allowing a substantially smaller main window.
+        self.root.minsize(560, 640)
 
     def _ensure_window_visible(self):
         """Clamp the mapped window to the visible screen so toolbar is never clipped."""
@@ -187,23 +190,66 @@ class ColocalizationApp:
         y = min(max(0, y), max(0, screen_h - cw_h))
         self._controls_win.geometry(f"+{x}+{y}")
 
+    def _position_images_window(self):
+        """Position the images window near the main window and keep it visible."""
+        if self._images_win is None or not self._images_win.winfo_exists():
+            return
+
+        self.root.update_idletasks()
+        self._images_win.update_idletasks()
+
+        screen_w = int(self.root.winfo_screenwidth())
+        screen_h = int(self.root.winfo_screenheight())
+
+        main_x = int(self.root.winfo_x())
+        main_y = int(self.root.winfo_y())
+        main_w = int(self.root.winfo_width())
+
+        iw_w = int(self._images_win.winfo_width())
+        iw_h = int(self._images_win.winfo_height())
+
+        x = main_x + main_w + 16
+        y = max(0, main_y)
+
+        if x + iw_w > screen_w:
+            x = max(0, main_x - iw_w - 16)
+
+        x = min(max(0, x), max(0, screen_w - iw_w))
+        y = min(max(0, y), max(0, screen_h - iw_h))
+        self._images_win.geometry(f"+{x}+{y}")
+
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._apply_theme()
         self._build_controls_window()
+        self._build_images_window()
 
-        # ── main paned layout ──────────────────────────────────────────────────
-        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-
-        left = ttk.LabelFrame(paned, text="Images  (draw ROI on left image)")
-        paned.add(left, weight=2)
-        self._build_image_panel(left)
-
-        right = ttk.Frame(paned)
-        paned.add(right, weight=3)
+        # ── main window now hosts analysis panels only ────────────────────────
+        right = ttk.Frame(self.root)
+        right.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
         self._build_right_panel(right)
+
+    def _build_images_window(self):
+        """Build a dedicated resizable window for channel image display."""
+        win = tk.Toplevel(self.root)
+        self._images_win = win
+        win.title("Channel Images")
+        win.configure(bg=BG2)
+        win.resizable(True, True)
+        win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        outer = ttk.LabelFrame(win, text="Images  (draw ROI on left image)", padding=4)
+        outer.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._build_image_panel(outer)
+
+        win.update_idletasks()
+        screen_w = int(win.winfo_screenwidth())
+        screen_h = int(win.winfo_screenheight())
+        w = min(max(640, int(win.winfo_reqwidth()) + 20), max(520, screen_w - 120))
+        h = min(max(420, int(win.winfo_reqheight()) + 20), max(360, screen_h - 140))
+        win.geometry(f"{w}x{h}")
+        win.minsize(620, 400)
 
     def _build_controls_window(self):
         """Build a compact secondary window containing all menu controls."""
@@ -325,8 +371,10 @@ class ColocalizationApp:
             outer.columnconfigure(col, weight=1)
 
         win.update_idletasks()
-        w = max(900, int(win.winfo_reqwidth()) + 8)
-        h = int(win.winfo_reqheight()) + 8
+        screen_w = int(win.winfo_screenwidth())
+        screen_h = int(win.winfo_screenheight())
+        w = min(max(760, int(win.winfo_reqwidth()) + 8), max(620, screen_w - 80))
+        h = min(int(win.winfo_reqheight()) + 8, max(280, screen_h - 120))
         win.geometry(f"{w}x{h}")
 
     def _attach_tooltip(self, widget, text: str):
@@ -407,6 +455,12 @@ class ColocalizationApp:
         try:
             if self._controls_win is not None and self._controls_win.winfo_exists():
                 self._controls_win.destroy()
+        except tk.TclError:
+            pass
+
+        try:
+            if self._images_win is not None and self._images_win.winfo_exists():
+                self._images_win.destroy()
         except tk.TclError:
             pass
 
