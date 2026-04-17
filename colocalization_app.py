@@ -1151,7 +1151,7 @@ class ColocalizationApp:
         """Create a contrast-stretched copy for display only."""
         if img.size == 0:
             return img
-        lo, hi = np.percentile(img, [1.0, 99.0])
+        lo, hi = np.percentile(img, [2.0, 98.0])
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             return img
         stretched = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
