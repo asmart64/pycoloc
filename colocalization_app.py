@@ -120,6 +120,7 @@ class ColocalizationApp:
         self._tooltip_win: tk.Toplevel | None = None
         self._tooltip_after_id = None
         self._despike_var = tk.BooleanVar(value=False)
+        self._autostretch_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -294,8 +295,17 @@ class ColocalizationApp:
             text="Preprocess hot pixels",
             variable=self._despike_var,
         )
-        cb_despike.grid(row=2, column=0, columnspan=3, padx=3, pady=2, sticky=tk.W)
+        cb_despike.grid(row=2, column=0, columnspan=2, padx=3, pady=2, sticky=tk.W)
         self._attach_tooltip(cb_despike, "Replace isolated bright outliers with local median")
+
+        cb_autostretch = ttk.Checkbutton(
+            outer,
+            text="Auto-stretch display",
+            variable=self._autostretch_var,
+            command=self._on_autostretch_toggle,
+        )
+        cb_autostretch.grid(row=2, column=2, padx=3, pady=2, sticky=tk.W)
+        self._attach_tooltip(cb_autostretch, "Enhance display contrast using robust percentiles")
 
         btn_pdf = ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18)
         btn_pdf.grid(row=2, column=3, padx=3, pady=2)
@@ -1023,6 +1033,22 @@ class ColocalizationApp:
         if self.ch2 is not None:
             self._t2_max = float(self.ch2.max())
 
+    @staticmethod
+    def _autostretch_for_display(img: np.ndarray) -> np.ndarray:
+        """Create a contrast-stretched copy for display only."""
+        if img.size == 0:
+            return img
+        lo, hi = np.percentile(img, [1.0, 99.0])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return img
+        stretched = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+        return stretched.astype(np.float32)
+
+    def _on_autostretch_toggle(self):
+        self._refresh_images()
+        mode = "ON" if self._autostretch_var.get() else "OFF"
+        self._status.set(f"Auto-stretch display {mode}.")
+
     # ── image display ──────────────────────────────────────────────────────────
 
     def _refresh_images(self):
@@ -1033,11 +1059,19 @@ class ColocalizationApp:
         ax1.set_title("Channel 2", color=MAGENTA, fontsize=10)
 
         if self.ch1 is not None:
-            ax0.imshow(self.ch1, cmap=_CYAN,    origin="upper",
-                       vmin=0, vmax=self.ch1.max())
+            ch1_disp = self.ch1
+            if self._autostretch_var.get():
+                ch1_disp = self._autostretch_for_display(self.ch1)
+                ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0.0, vmax=1.0)
+            else:
+                ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0, vmax=self.ch1.max())
         if self.ch2 is not None:
-            ax1.imshow(self.ch2, cmap=_MAGENTA, origin="upper",
-                       vmin=0, vmax=self.ch2.max())
+            ch2_disp = self.ch2
+            if self._autostretch_var.get():
+                ch2_disp = self._autostretch_for_display(self.ch2)
+                ax1.imshow(ch2_disp, cmap=_MAGENTA, origin="upper", vmin=0.0, vmax=1.0)
+            else:
+                ax1.imshow(ch2_disp, cmap=_MAGENTA, origin="upper", vmin=0, vmax=self.ch2.max())
 
         if self.roi is not None:
             x1, y1, x2, y2 = self.roi
