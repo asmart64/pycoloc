@@ -620,6 +620,8 @@ class ColocalizationApp:
             row=2, column=0, padx=6, sticky=tk.W, pady=3)
         self._entry_psf = ttk.Entry(parent, textvariable=self._psf_var, width=9)
         self._entry_psf.grid(row=2, column=1, padx=4, sticky=tk.W)
+        self._entry_psf.bind("<Return>", lambda e: self._on_psf_change())
+        self._entry_psf.bind("<FocusOut>", lambda e: self._on_psf_change())
 
         ttk.Label(parent, text="(press Enter or Tab to apply typed value)",
                   foreground=GRAY, font=("TkDefaultFont", 8)).grid(
@@ -638,6 +640,17 @@ class ColocalizationApp:
         psf_px = max(2.0, psf_px)
         self._psf_var.set(f"{psf_px:.1f}")
         return int(round(psf_px))
+
+    def _on_psf_change(self):
+        """Apply PSF edits and re-run analysis when images are loaded."""
+        self._get_psf_block_size()  # sanitize and normalize field formatting
+
+        if self.ch1 is None or self.ch2 is None:
+            return
+
+        self._status.set("PSF updated - rerunning analysis...")
+        self.root.update_idletasks()
+        self.run_analysis()
 
     def _entry_update(self, channel: int):
         """Parse the manually typed threshold value and apply it."""
@@ -1704,6 +1717,9 @@ class ColocalizationApp:
             self._style_ax(ax, title=title,
                            xlabel="Intensity", ylabel="Pixel count (log)",
                            title_color=color)
+            ax.minorticks_on()
+            ax.grid(axis="x", which="major", color=GRAY, alpha=0.26, linestyle="-", linewidth=0.6)
+            ax.grid(axis="x", which="minor", color=GRAY, alpha=0.14, linestyle="-", linewidth=0.35)
             ax.legend(fontsize=7, facecolor="#111122",
                       labelcolor="white", framealpha=0.9)
             return threshold_line
