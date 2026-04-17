@@ -29,6 +29,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime
+import subprocess
 
 import numpy as np
 import warnings
@@ -82,13 +83,35 @@ GREEN  = "#a6e3a1"
 GRAY   = "#6c7086"
 
 
+def _detect_app_version() -> str:
+    """Return a short build identifier, preferring the current git commit."""
+    try:
+        repo_dir = Path(__file__).resolve().parent
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=1.0,
+        )
+        commit = result.stdout.strip()
+        if commit:
+            return f"git-{commit}"
+    except Exception:
+        pass
+    return "dev"
+
+
+APP_VERSION = _detect_app_version()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 class ColocalizationApp:
     """Main application window."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Colocalization Analyzer — Mander's Coefficients")
+        self.root.title(f"Colocalization Analyzer — Mander's Coefficients ({APP_VERSION})")
         self.root.configure(bg=BG2)
         # Use a screen-aware startup size so the window never opens off-screen.
         self._set_initial_window_geometry()
@@ -608,6 +631,13 @@ class ColocalizationApp:
     def _build_results_tab(self, parent):
         outer = ttk.Frame(parent, padding=14)
         outer.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            outer,
+            text=f"App version: {APP_VERSION}",
+            foreground=CYAN,
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(anchor=tk.E, pady=(0, 6))
 
         # formula reference
         ref = (
@@ -1948,6 +1978,7 @@ class ColocalizationApp:
                 lines = [
                     "Colocalization Analyzer - PDF Summary",
                     "",
+                    f"App version: {APP_VERSION}",
                     f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     f"Image shape: {self.ch1.shape}",
                     f"ROI: {roi_text}",
