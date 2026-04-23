@@ -48,21 +48,29 @@ It includes:
 - **Rectangle mode**: draw and interactively resize a rectangular ROI on Channel 1; mirrored on Channel 2
 - **Lasso mode**: freehand polygon ROI for arbitrary region selection
 - Clear ROI to revert analysis to the full image
-- Costes randomization is disabled for lasso ROIs (non-rectangular mask incompatible with block shuffling)
+- Costes randomization supports both rectangular and lasso ROIs
 
 ### 3) Costes automatic thresholding
 
 Given flattened pixel vectors `c1` and `c2`:
 
 1. Fit linear regression `Ch2 = a * Ch1 + b`
-2. Scan candidate `T1` values from high to low
-3. Pair each `T1` with `T2 = clip(a*T1 + b)`
-4. Compute Pearson `r` on pixels below both thresholds
-5. Select the first threshold where background correlation becomes
-   non-positive (`r <= 0`) with minimum foreground support constraints
+2. Follow the Coloc2 stepping rule: step on `Ch1` when `-1 < a < 1`, otherwise step on `Ch2`
+3. Round each candidate threshold pair to integer image levels, matching Coloc2 behavior
+4. Compute Pearson `r` on the Costes background set `c1 < T1 OR c2 < T2`
+5. Stop using the Coloc2-style SimpleStepper criteria when background `r` becomes very small, non-finite, or starts increasing again
 
-This gives robust automatic thresholds while avoiding degenerate tiny-tail
-foreground solutions.
+This aligns the automatic threshold search more closely with Coloc2 instead of the earlier simplified scan.
+
+### Coloc2 alignment changes
+
+The recent Costes updates were introduced specifically to match Coloc2 more closely:
+
+- Threshold stepping now follows the active channel rule used by Coloc2 (`Ch1` for slopes between `-1` and `1`, otherwise `Ch2`)
+- Background correlation is evaluated on the union mask `c1 < T1 OR c2 < T2`, matching Coloc2 `ThresholdMode.Below`
+- Threshold candidates are rounded to integer image intensities before evaluation
+- The Costes curve now stores and displays both members of the threshold pair, so the `Pearson vs T1` plot also exposes the paired `T2` values
+- Costes randomization now works for lasso ROIs by shuffling blocks inside the lasso bounding box and evaluating Pearson only on pixels inside the lasso mask
 
 ### 4) Metrics reported
 
@@ -82,7 +90,7 @@ The results panel reports:
 
 - Two intensity histograms (one per channel) with threshold markers and vertical grids
 - Pixel scatter plot with threshold crosshairs and regression line
-- Costes curve: background `r` versus `T1`, including zero-crossing context
+- Costes curve: background `r` versus `T1`, with paired `T2` values shown on the top axis
 
 ### 6) Manual threshold mode
 
@@ -141,7 +149,7 @@ python colocalization_app.py
 - Both channels must have the same spatial dimensions.
 - For TIFF export and optimal TIFF loading, `tifffile` is recommended.
 - Randomization block size is controlled by the PSF field (in pixels).
-- Lasso ROI does not support Costes randomization.
+- For lasso ROI, Costes randomization is evaluated inside the lasso bounding box but only masked lasso pixels contribute to Pearson statistics.
 - All three windows must remain open for full functionality; closing any one exits the app.
 
 ## Repository layout

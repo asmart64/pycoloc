@@ -136,7 +136,8 @@ class ColocalizationApp:
         }
         self._last_costes_slope: float | None = None
         self._last_costes_intercept: float | None = None
-        self._last_costes_curve_t = np.array([])
+        self._last_costes_curve_t1 = np.array([])
+        self._last_costes_curve_t2 = np.array([])
         self._last_costes_curve_r = np.array([])
         self._roi_overlay_after_id = None
         self._controls_win: tk.Toplevel | None = None
@@ -147,7 +148,7 @@ class ColocalizationApp:
         self._autostretch_var = tk.BooleanVar(value=False)
         self._histeq_var = tk.BooleanVar(value=False)
         self._clahe_var = tk.BooleanVar(value=False)
-        self._orthreg_var = tk.BooleanVar(value=False)
+        self._orthreg_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -1668,6 +1669,39 @@ class ColocalizationApp:
             c2 = c2_img.ravel()
         return c1, c2
 
+    def _get_randomization_arrays(self, preprocess: bool = False):
+        """Return 2D analysis arrays plus an optional ROI mask for randomization."""
+        if self.ch1 is None or self.ch2 is None:
+            return None, None, None
+        if self.ch1.shape[:2] != self.ch2.shape[:2]:
+            messagebox.showerror(
+                "Shape mismatch",
+                "Both channels must have identical spatial dimensions.\n"
+                f"Ch1: {self.ch1.shape}   Ch2: {self.ch2.shape}",
+            )
+            return None, None, None
+
+        if self._roi_kind == "lasso" and self.roi_mask is not None:
+            c1_img = self.ch1
+            c2_img = self.ch2
+            roi_mask = self.roi_mask
+        elif self.roi and self._roi_kind == "rect":
+            x1, y1, x2, y2 = self.roi
+            c1_img = self.ch1[y1:y2, x1:x2]
+            c2_img = self.ch2[y1:y2, x1:x2]
+            roi_mask = None
+        else:
+            c1_img = self.ch1
+            c2_img = self.ch2
+            roi_mask = None
+
+        c1_img, c2_img = self._apply_background_subtraction(c1_img, c2_img)
+        if preprocess and self._despike_var.get():
+            c1_img = self._despike_hot_pixels(c1_img)
+            c2_img = self._despike_hot_pixels(c2_img)
+
+        return c1_img, c2_img, roi_mask
+
     # ── Costes algorithm ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -1704,16 +1738,17 @@ class ColocalizationApp:
         Steps
         -----
         1. Fit regression  Ch2 = a·Ch1 + b  (OLS or orthogonal, see `orthogonal`).
-        2. Starting from max(Ch1) decrease T1; paired T2 = a·T1 + b.
+          2. Starting from channel max, decrease the working threshold by 1
+              intensity unit per step (Coloc2 SimpleStepper). If |a| < 1 the
+              working threshold is Ch1, otherwise Ch2; the paired threshold is
+              mapped via the regression line.
         3. At each step compute Pearson's r for pixels BELOW the threshold
-           pair: c1 < T1 AND c2 < T2.  These are the putative background
+           pair: c1 < T1 OR c2 < T2 (union / background region, per Costes 2004
+           and Coloc2).  These are the putative background
            pixels; they should be uncorrelated (r ≤ 0) when the threshold
            sits above all real signal.
-        4. The threshold is the FIRST T1 (scanning high → low) at which
-           r_background ≤ 0.  Above this threshold, background has no
-              positive correlation – only genuine colocalized signal remains.
-              A minimum foreground-support rule is applied to avoid selecting a
-              threshold when only a tiny high-intensity tail remains.
+          4. Stop when r_background becomes very small (< 1e-4), becomes NaN,
+              or starts increasing again; this mirrors Coloc2's stopping rule.
 
         Parameters
         ----------
@@ -1726,7 +1761,8 @@ class ColocalizationApp:
         -------
         t1, t2 : optimal threshold values
         slope, intercept : regression coefficients
-        curve_t1, curve_r : r of below-threshold pixels at each step
+        curve_t1, curve_t2, curve_r : threshold-pair scan and Pearson r of
+            below-threshold pixels at each step
         """
         if orthogonal:
             slope, intercept = ColocalizationApp._orthogonal_regression(c1, c2)
@@ -1735,68 +1771,82 @@ class ColocalizationApp:
             slope, intercept = float(res.slope), float(res.intercept)
 
         max1, min1 = float(c1.max()), float(c1.min())
-        max2        = float(c2.max())
-        candidates  = np.linspace(max1, min1, n_steps + 1)   # high → low
+        max2, min2 = float(c2.max()), float(c2.min())
 
-        n_total = len(c1)
-        min_fg_pixels = max(100, int(0.005 * n_total))
+        curve_t1, curve_t2, curve_r = [], [], []
+        best_r_any = float("inf")
+        t1_opt = float(np.percentile(c1, 95))
+        t2_opt = float(np.clip(slope * t1_opt + intercept, min2, max2))
+        t1_opt_any = t1_opt
+        t2_opt_any = t2_opt
 
-        curve_t1, curve_r = [], []
-        # Track the candidate with the lowest r seen so far (fallback if no
-        # zero-crossing is found — happens with residual background correlation).
-        best_r      = float("inf")
-        best_r_any  = float("inf")
-        t1_opt      = float(np.percentile(c1, 95))   # conservative fallback
-        t2_opt      = float(np.clip(slope * t1_opt + intercept, 0.0, max2))
-        t1_opt_any  = t1_opt
-        t2_opt_any  = t2_opt
+        # Coloc2 behavior: step on Ch1 if -1 < slope < 1, otherwise on Ch2.
+        step_on_ch1 = (-1.0 < slope < 1.0)
+        work_t = max1 if step_on_ch1 else max2
 
-        for t1_cand in candidates:
-            t2_cand = float(np.clip(slope * t1_cand + intercept, 0.0, max2))
+        # Coloc2 SimpleStepper defaults.
+        current_r = 1.0
+        last_r = float("inf")
+        finished = False
 
-            # Background = pixels BELOW both thresholds
-            mask = (c1 < t1_cand) & (c2 < t2_cand)
-            if mask.sum() < 10:
-                continue
-            c1b, c2b = c1[mask], c2[mask]
-            if c1b.std() < 1e-9 or c2b.std() < 1e-9:
-                continue
+        while not finished:
+            if step_on_ch1:
+                t1_raw = work_t
+                t2_raw = slope * work_t + intercept
+            else:
+                t2_raw = work_t
+                if abs(slope) < 1e-12:
+                    t1_raw = max1
+                else:
+                    t1_raw = (work_t - intercept) / slope
 
-            r = float(stats.pearsonr(c1b, c2b)[0])
+            # Coloc2 rounds thresholds to integer image levels.
+            t1_cand = float(np.clip(np.floor(t1_raw + 0.5), min1, max1))
+            t2_cand = float(np.clip(np.floor(t2_raw + 0.5), min2, max2))
+
+            # ThresholdMode.Below in Coloc2: ch1 < T1 OR ch2 < T2.
+            mask = (c1 < t1_cand) | (c2 < t2_cand)
+            if mask.sum() >= 3:
+                c1b, c2b = c1[mask], c2[mask]
+                if c1b.std() >= 1e-9 and c2b.std() >= 1e-9:
+                    r = float(stats.pearsonr(c1b, c2b)[0])
+                else:
+                    r = float("nan")
+            else:
+                r = float("nan")
+
             curve_t1.append(t1_cand)
+            curve_t2.append(t2_cand)
             curve_r.append(r)
 
-            fg_count = n_total - int(mask.sum())
-            fg1_count = int(np.count_nonzero(c1 >= t1_cand))
-            fg2_count = int(np.count_nonzero(c2 >= t2_cand))
-            has_channel_support = (
-                fg1_count >= min_fg_pixels and fg2_count >= min_fg_pixels
-            )
-
-            # Keep a global fallback regardless of support.
-            if r < best_r_any:
+            if np.isfinite(r) and r < best_r_any:
                 best_r_any = r
                 t1_opt_any = t1_cand
                 t2_opt_any = t2_cand
 
-            # Supported candidates only: avoid tiny foreground tails.
-            if fg_count >= min_fg_pixels and has_channel_support and r < best_r:
-                best_r = r
-                t1_opt = t1_cand
-                t2_opt = t2_cand
+            # Store the current candidate as the stepper output threshold.
+            t1_opt = t1_cand
+            t2_opt = t2_cand
 
-            if r <= 0.0 and fg_count >= min_fg_pixels and has_channel_support:
-                # Background is uncorrelated → genuine Costes threshold found
-                break
+            # Emulate Coloc2 SimpleStepper update() and termination criteria.
+            last_r, current_r = current_r, r
+            next_work_t = work_t - 1.0
+            finished = (
+                (not np.isfinite(r)) or
+                (next_work_t < 1.0) or
+                (r < 0.0001) or
+                (r > last_r)
+            )
+            work_t = next_work_t
 
-        # If no supported candidate was found, fall back to the global minimum-r.
-        if best_r == float("inf"):
+        # Fallback: if all evaluated r were non-finite, keep conservative defaults.
+        if not np.isfinite(best_r_any):
             t1_opt, t2_opt = t1_opt_any, t2_opt_any
 
         return (
             t1_opt, t2_opt,
             slope, intercept,
-            np.asarray(curve_t1), np.asarray(curve_r),
+            np.asarray(curve_t1), np.asarray(curve_t2), np.asarray(curve_r),
         )
 
     # ── Mander's coefficients ──────────────────────────────────────────────────
@@ -1849,7 +1899,8 @@ class ColocalizationApp:
     @staticmethod
     def costes_randomization(c1_img: np.ndarray, c2_img: np.ndarray,
                              n_iter: int = 100, block_size: int | None = None,
-                             seed: int = 12345) -> dict:
+                             seed: int = 12345,
+                             roi_mask: np.ndarray | None = None) -> dict:
         """
         Costes randomization significance test.
 
@@ -1857,9 +1908,29 @@ class ColocalizationApp:
         randomized repeatedly. This preserves local intensity structure within
         each block while destroying cross-channel spatial correspondence.
         The block size should reflect the microscope PSF scale (in pixels), as
-        done in Coloc2.
+        done in Coloc2. When `roi_mask` is provided, the shuffle is performed
+        within the ROI bounding box and Pearson's r is evaluated only on pixels
+        selected by the mask.
         """
         h, w = c1_img.shape
+        mask = None
+        if roi_mask is not None:
+            mask = np.asarray(roi_mask, dtype=bool)
+            if mask.shape != c1_img.shape:
+                raise ValueError("roi_mask must match the image shape for Costes randomization")
+            if not np.any(mask):
+                return dict(observed_r=float("nan"), random_mean=float("nan"),
+                            random_std=float("nan"), significance=float("nan"),
+                            p_value=float("nan"), block_size=0, n_iter=0)
+
+            ys, xs = np.where(mask)
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            c1_img = c1_img[y0:y1, x0:x1]
+            c2_img = c2_img[y0:y1, x0:x1]
+            mask = mask[y0:y1, x0:x1]
+            h, w = c1_img.shape
+
         min_dim = min(h, w)
         if min_dim < 8:
             return dict(observed_r=float("nan"), random_mean=float("nan"),
@@ -1882,10 +1953,39 @@ class ColocalizationApp:
                         random_std=float("nan"), significance=float("nan"),
                         p_value=float("nan"), block_size=block_size, n_iter=0)
 
-        c1_crop = c1_img[:crop_h, :crop_w]
-        c2_crop = c2_img[:crop_h, :crop_w]
-        c1_flat = c1_crop.ravel()
-        c2_flat = c2_crop.ravel()
+        if mask is None:
+            c1_crop = c1_img[:crop_h, :crop_w]
+            c2_crop = c2_img[:crop_h, :crop_w]
+            mask_crop = None
+        else:
+            best_score = -1
+            best_offsets = (0, 0)
+            max_y0 = h - crop_h
+            max_x0 = w - crop_w
+            for y_off in range(max_y0 + 1):
+                for x_off in range(max_x0 + 1):
+                    score = int(mask[y_off:y_off + crop_h, x_off:x_off + crop_w].sum())
+                    if score > best_score:
+                        best_score = score
+                        best_offsets = (y_off, x_off)
+
+            if best_score < 3:
+                return dict(observed_r=float("nan"), random_mean=float("nan"),
+                            random_std=float("nan"), significance=float("nan"),
+                            p_value=float("nan"), block_size=block_size, n_iter=0)
+
+            y_off, x_off = best_offsets
+            c1_crop = c1_img[y_off:y_off + crop_h, x_off:x_off + crop_w]
+            c2_crop = c2_img[y_off:y_off + crop_h, x_off:x_off + crop_w]
+            mask_crop = mask[y_off:y_off + crop_h, x_off:x_off + crop_w]
+
+        if mask_crop is None:
+            c1_flat = c1_crop.ravel()
+            c2_flat = c2_crop.ravel()
+        else:
+            c1_flat = c1_crop[mask_crop]
+            c2_flat = c2_crop[mask_crop]
+
         if c1_flat.std() < 1e-9 or c2_flat.std() < 1e-9:
             return dict(observed_r=float("nan"), random_mean=float("nan"),
                         random_std=float("nan"), significance=float("nan"),
@@ -1904,7 +2004,8 @@ class ColocalizationApp:
             perm = rng.permutation(blocks.shape[0])
             shuffled = blocks[perm].reshape(ny, nx, block_size, block_size)
             shuffled = shuffled.transpose(0, 2, 1, 3).reshape(crop_h, crop_w)
-            randomized_r[idx] = float(stats.pearsonr(c1_flat, shuffled.ravel())[0])
+            shuffled_flat = shuffled.ravel() if mask_crop is None else shuffled[mask_crop]
+            randomized_r[idx] = float(stats.pearsonr(c1_flat, shuffled_flat)[0])
 
         random_mean = float(randomized_r.mean())
         random_std = float(randomized_r.std(ddof=1)) if n_iter > 1 else 0.0
@@ -1945,40 +2046,26 @@ class ColocalizationApp:
         self._status.set("Running Costes algorithm…")
         self.root.update_idletasks()
 
-        t1, t2, slope, intercept, curve_t, curve_r = self.costes_threshold(
+        t1, t2, slope, intercept, curve_t1, curve_t2, curve_r = self.costes_threshold(
             c1, c2, orthogonal=self._orthreg_var.get()
         )
         self._last_costes_slope = slope
         self._last_costes_intercept = intercept
-        self._last_costes_curve_t = curve_t
+        self._last_costes_curve_t1 = curve_t1
+        self._last_costes_curve_t2 = curve_t2
         self._last_costes_curve_r = curve_r
         res = self.manders(c1, c2, t1, t2)
-        if self._roi_kind == "lasso":
-            # Costes randomization operates on rectangular image tiles.
-            messagebox.showwarning(
-                "Costes randomization unavailable",
-                "Costes randomization is disabled for lasso ROI because it "
-                "relies on block shuffling of rectangular image tiles. "
-                "A freehand ROI is a non-rectangular mask, so block-wise "
-                "spatial randomization is not well-defined in this mode."
-            )
-            rand = dict(
-                observed_r=float("nan"),
-                random_mean=float("nan"),
-                random_std=float("nan"),
-                significance=float("nan"),
-                p_value=float("nan"),
-                block_size=0,
-                n_iter=0,
-            )
-        else:
-            self._status.set("Running Costes randomization…")
-            self.root.update_idletasks()
-            rand = self.costes_randomization(
-                c1_img,
-                c2_img,
-                block_size=self._get_psf_block_size(),
-            )
+        self._status.set("Running Costes randomization…")
+        self.root.update_idletasks()
+        rand_c1_img, rand_c2_img, rand_mask = self._get_randomization_arrays(
+            preprocess=use_preprocess
+        )
+        rand = self.costes_randomization(
+            rand_c1_img,
+            rand_c2_img,
+            block_size=self._get_psf_block_size(),
+            roi_mask=rand_mask,
+        )
 
         # update threshold entry fields
         self._t1_entry_var.set(f"{t1:.1f}")
@@ -2009,7 +2096,7 @@ class ColocalizationApp:
 
         # plots
         self._draw_histograms(c1, c2, t1, t2)
-        self._draw_costes(c1, c2, t1, t2, slope, intercept, curve_t, curve_r)
+        self._draw_costes(c1, c2, t1, t2, slope, intercept, curve_t1, curve_t2, curve_r)
 
         self._status.set(
             f"Done  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
@@ -2023,7 +2110,6 @@ class ColocalizationApp:
                 if (float(self._bg1_var.get()) > 0.0 or float(self._bg2_var.get()) > 0.0)
                 else ""
             )
-            + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
         )
 
     def _slider_update(self, _=None, draw_plots: bool = True):
@@ -2056,7 +2142,8 @@ class ColocalizationApp:
                     c1, c2, t1, t2,
                     self._last_costes_slope,
                     self._last_costes_intercept,
-                    self._last_costes_curve_t,
+                    self._last_costes_curve_t1,
+                    self._last_costes_curve_t2,
                     self._last_costes_curve_r,
                 )
 
@@ -2132,7 +2219,8 @@ class ColocalizationApp:
     def _draw_costes(self, c1: np.ndarray, c2: np.ndarray,
                      t1: float, t2: float,
                      slope: float, intercept: float,
-                     curve_t: np.ndarray, curve_r: np.ndarray):
+                     curve_t1: np.ndarray, curve_t2: np.ndarray,
+                     curve_r: np.ndarray):
 
         ax_sc, ax_r = self._costes_axes
         ax_sc.cla(); ax_r.cla()
@@ -2176,28 +2264,45 @@ class ColocalizationApp:
                      labelcolor="white", framealpha=0.9, markerscale=4)
 
         # ── Costes r-vs-threshold curve ────────────────────────────────────────
-        if len(curve_t) > 1:
+        if len(curve_t1) > 1:
             curve_r_arr = np.asarray(curve_r)
-            ax_r.plot(curve_t, curve_r_arr, color="white",
+            ax_r.plot(curve_t1, curve_r_arr, color="white",
                       linewidth=1.8, label="r(background)  vs  T₁")
             # r > 0: background pixels still correlate → threshold too high
-            ax_r.fill_between(curve_t, curve_r_arr, 0,
+            ax_r.fill_between(curve_t1, curve_r_arr, 0,
                                where=(curve_r_arr > 0),
                                color="steelblue", alpha=0.30,
                                label="r > 0  (signal leaks into background)")
             # r ≤ 0: background is uncorrelated → threshold is at or above signal
-            ax_r.fill_between(curve_t, curve_r_arr, 0,
+            ax_r.fill_between(curve_t1, curve_r_arr, 0,
                                where=(curve_r_arr <= 0),
                                color="#a6e3a1", alpha=0.35,
                                label="r ≤ 0  (background uncorrelated ✓)")
             ax_r.axhline(0, color="red", linewidth=1.2, linestyle=":")
             ax_r.axvline(t1, color=YELLOW, linewidth=2, linestyle="-.",
-                         label=f"Costes T₁ = {t1:.1f}")
+                         label=f"Costes thresholds = ({t1:.1f}, {t2:.1f})")
             self._style_ax(ax_r,
                            title="Costes:  r of BELOW-threshold pixels vs T₁\n"
-                                 "(threshold = first T₁ where r_background ≤ 0)",
+                                 "(paired T₂ shown on top axis)",
                            xlabel="Ch1 Threshold  (decreasing →)",
                            ylabel="Pearson's r  (background pixels)")
+
+            secax = ax_r.secondary_xaxis("top")
+            sample_idx = np.linspace(0, len(curve_t1) - 1, min(6, len(curve_t1)), dtype=int)
+            sample_idx = np.unique(sample_idx)
+            tick_pairs = []
+            for idx in sample_idx:
+                pos = float(curve_t1[idx])
+                if any(abs(pos - existing_pos) < 1e-9 for existing_pos, _ in tick_pairs):
+                    continue
+                tick_pairs.append((pos, f"{float(curve_t2[idx]):.1f}"))
+            if tick_pairs:
+                secax.set_xticks([pos for pos, _ in tick_pairs])
+                secax.set_xticklabels([label for _, label in tick_pairs])
+            secax.set_xlabel("Paired Ch2 Threshold  (T₂)")
+            secax.tick_params(axis="x", colors=FG, labelsize=8)
+            secax.xaxis.label.set_color(FG)
+
             ax_r.legend(fontsize=7, facecolor="#111122",
                         labelcolor="white", framealpha=0.9)
             ax_r.invert_xaxis()   # show threshold decreasing left to right
