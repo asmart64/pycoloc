@@ -1,0 +1,82 @@
+
+Is the Costes thresholding algorithm symmetric with respect to a swapping of Red and green images. I.E. do we find the swapped thresholds?
+## Symmetry of the Costes Autothreshold
+
+This is a subtle and important question. The short answer is: **not exactly**, and the asymmetry comes from two sources.
+
+---
+
+### Source 1: The Regression Line
+
+The threshold pair $(T_R, T_G)$ is constrained to lie on the regression line fitted to the scatter plot:
+
+$$G = a \cdot R + b$$
+
+If you swap channels, the regression is now:
+
+$$R = a' \cdot G + b'$$
+
+These are **not the same line**. Ordinary least squares minimizes residuals in the *dependent* variable only — the line $G = aR + b$ minimizes vertical residuals, while $R = a'G + b'$ minimizes horizontal residuals. They coincide only when $r = \pm 1$ (perfect correlation). In general:
+
+$$a' \neq \frac{1}{a} \quad \text{and} \quad b' \neq -\frac{b}{a}$$
+
+So the path along which the algorithm walks when scanning thresholds is geometrically different depending on which channel is treated as dependent. The threshold pairs found will generally not be exact swaps of each other.
+
+---
+
+### Source 2: The Pearson Criterion Is Symmetric, But the Pixel Set Is Not
+
+The stopping criterion — Pearson $r$ of sub-threshold pixels $\leq 0$ — uses Pearson's $r$, which is itself symmetric in $R$ and $G$. So this part does not introduce asymmetry.
+
+However, the **sub-threshold pixel set** $S$ is defined as:
+
+$$S = \{ i : R_i < T_R \;\text{and}\; G_i < T_G \}$$
+
+This set is the same regardless of which channel you call "red" or "green" — it depends only on the pair $(T_R, T_G)$. So the Pearson computation on $S$ is symmetric.
+
+The asymmetry arises entirely from the regression step determining **which $(T_R, T_G)$ pairs are visited** during the scan.
+
+---
+
+### What Happens in Practice
+
+Consider the scatter plot geometry:
+
+```
+G ↑         
+  |    . cloud
+  |   .
+b |  .
+  | .
+  +----------→ R
+```
+
+- Walking along $G = aR + b$ from high $R$ downward visits one set of $(T_R, T_G)$ pairs
+- Walking along $R = a'G + b'$ from high $G$ downward visits a different set
+
+The threshold found by the first walk and the threshold found by the second will generally **not satisfy** $T_G^{(1)} = T_R^{(2)}$ and $T_R^{(1)} = T_G^{(2)}$ unless the scatter is perfectly symmetric around the diagonal.
+
+---
+
+### The Special Case Where Symmetry Holds
+
+Exact symmetry is recovered when:
+
+- The scatter plot is symmetric about the $R = G$ diagonal, i.e. the two channels have the same mean, variance, and joint distribution
+- The regression line passes through the origin with slope $a = 1$ and $b = 0$
+
+In this case both regression lines are identical ($G = R$) and the algorithm finds exactly swapped thresholds.
+
+---
+
+### Practical Consequence
+
+In real data, the two channels almost never have matched means and variances — one fluorophore is brighter, one antibody labels more densely, etc. So if you run Coloc 2 with channels swapped, you will in general get:
+
+- Different $T_R$, $T_G$ values
+- Slightly different M₁ and M₂ (because the thresholds change)
+- The same Pearson $r$ and ICQ (which don't depend on the threshold)
+
+This is actually an underappreciated source of variability in published colocalization results. **The convention in Coloc 2 is to always put the dimmer or sparser channel as channel 1** (red), which tends to give a more stable regression, but this is a convention, not a mathematical fix.
+
+The asymmetry is a real limitation of the Costes method — it is one of the motivations for methods that use orthogonal regression (minimizing perpendicular residuals) rather than ordinary least squares, which would be fully symmetric by construction.

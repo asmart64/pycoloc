@@ -145,6 +145,8 @@ class ColocalizationApp:
         self._tooltip_after_id = None
         self._despike_var = tk.BooleanVar(value=False)
         self._autostretch_var = tk.BooleanVar(value=False)
+        self._histeq_var = tk.BooleanVar(value=False)
+        self._clahe_var = tk.BooleanVar(value=False)
         self._orthreg_var = tk.BooleanVar(value=False)
 
         self._build_ui()
@@ -377,6 +379,30 @@ class ColocalizationApp:
         )
         cb_autostretch.grid(row=2, column=2, padx=3, pady=2, sticky=tk.W)
         self._attach_tooltip(cb_autostretch, "Enhance display contrast using robust percentiles")
+
+        cb_histeq = ttk.Checkbutton(
+            outer,
+            text="Histogram equalization display",
+            variable=self._histeq_var,
+            command=self._on_histeq_toggle,
+        )
+        cb_histeq.grid(row=2, column=3, padx=3, pady=2, sticky=tk.W)
+        self._attach_tooltip(
+            cb_histeq,
+            "Aggressive display contrast enhancement using per-channel histogram equalization",
+        )
+
+        cb_clahe = ttk.Checkbutton(
+            outer,
+            text="CLAHE display",
+            variable=self._clahe_var,
+            command=self._on_clahe_toggle,
+        )
+        cb_clahe.grid(row=2, column=4, padx=3, pady=2, sticky=tk.W)
+        self._attach_tooltip(
+            cb_clahe,
+            "Adaptive local histogram equalization (CLAHE) for uneven illumination",
+        )
 
         # Row 3
         cb_orthreg = ttk.Checkbutton(
@@ -713,6 +739,8 @@ class ColocalizationApp:
         self._t1_max = 255.0
         self._t2_max = 255.0
         self._psf_var = tk.StringVar(value="3.0")
+        self._bg1_var = tk.StringVar(value="0.0")
+        self._bg2_var = tk.StringVar(value="0.0")
         self._t1_entry_var = tk.StringVar(value="0.0")
         self._t2_entry_var = tk.StringVar(value="0.0")
 
@@ -738,9 +766,26 @@ class ColocalizationApp:
         self._entry_psf.bind("<Return>", lambda e: self._on_psf_change())
         self._entry_psf.bind("<FocusOut>", lambda e: self._on_psf_change())
 
+        ttk.Label(parent, text="Background Ch1:").grid(
+            row=3, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_bg1 = ttk.Entry(parent, textvariable=self._bg1_var, width=9)
+        self._entry_bg1.grid(row=3, column=1, padx=4, sticky=tk.W)
+        self._entry_bg1.bind("<Return>", lambda e: self._on_background_change())
+        self._entry_bg1.bind("<FocusOut>", lambda e: self._on_background_change())
+
+        ttk.Label(parent, text="Background Ch2:").grid(
+            row=4, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_bg2 = ttk.Entry(parent, textvariable=self._bg2_var, width=9)
+        self._entry_bg2.grid(row=4, column=1, padx=4, sticky=tk.W)
+        self._entry_bg2.bind("<Return>", lambda e: self._on_background_change())
+        self._entry_bg2.bind("<FocusOut>", lambda e: self._on_background_change())
+
+        ttk.Button(parent, text="Apply BG", command=self._on_background_change).grid(
+            row=3, column=2, rowspan=2, padx=8, sticky=tk.NS)
+
         ttk.Label(parent, text="(press Enter or Tab to apply typed value)",
                   foreground=GRAY, font=("TkDefaultFont", 8)).grid(
-            row=3, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 2))
+            row=5, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 2))
 
         parent.columnconfigure(1, weight=1)
 
@@ -764,6 +809,54 @@ class ColocalizationApp:
             return
 
         self._status.set("PSF updated - rerunning analysis...")
+        self.root.update_idletasks()
+        self.run_analysis()
+
+    def _get_background_levels(self) -> tuple[float, float]:
+        """Get per-channel constant background values for subtraction."""
+        try:
+            bg1 = float(self._bg1_var.get())
+        except ValueError:
+            bg1 = 0.0
+        try:
+            bg2 = float(self._bg2_var.get())
+        except ValueError:
+            bg2 = 0.0
+
+        if not np.isfinite(bg1):
+            bg1 = 0.0
+        if not np.isfinite(bg2):
+            bg2 = 0.0
+
+        bg1 = max(0.0, bg1)
+        bg2 = max(0.0, bg2)
+        self._bg1_var.set(f"{bg1:.1f}")
+        self._bg2_var.set(f"{bg2:.1f}")
+        return bg1, bg2
+
+    def _apply_background_subtraction(self, c1: np.ndarray, c2: np.ndarray):
+        """Subtract constant per-channel background and clamp to non-negative."""
+        bg1, bg2 = self._get_background_levels()
+        if bg1 > 0.0:
+            c1 = np.clip(c1 - bg1, 0.0, None)
+        if bg2 > 0.0:
+            c2 = np.clip(c2 - bg2, 0.0, None)
+        return c1, c2
+
+    def _on_background_change(self):
+        """Apply background subtraction edits and refresh analysis if possible."""
+        bg1, bg2 = self._get_background_levels()
+        self._sync_slider_range()
+
+        if self.ch1 is None or self.ch2 is None:
+            self._status.set(
+                f"Background subtraction set (Ch1={bg1:.1f}, Ch2={bg2:.1f})."
+            )
+            return
+
+        self._status.set(
+            f"Background subtraction set (Ch1={bg1:.1f}, Ch2={bg2:.1f}) - rerunning analysis..."
+        )
         self.root.update_idletasks()
         self.run_analysis()
 
@@ -1186,10 +1279,11 @@ class ColocalizationApp:
         return ch1, ch2
 
     def _sync_slider_range(self):
+        bg1, bg2 = self._get_background_levels()
         if self.ch1 is not None:
-            self._t1_max = float(self.ch1.max())
+            self._t1_max = max(0.0, float(self.ch1.max()) - bg1)
         if self.ch2 is not None:
-            self._t2_max = float(self.ch2.max())
+            self._t2_max = max(0.0, float(self.ch2.max()) - bg2)
 
     @staticmethod
     def _autostretch_for_display(img: np.ndarray) -> np.ndarray:
@@ -1202,10 +1296,126 @@ class ColocalizationApp:
         stretched = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
         return stretched.astype(np.float32)
 
+    @staticmethod
+    def _histeq_for_display(img: np.ndarray) -> np.ndarray:
+        """Create a histogram-equalized copy for display only."""
+        if img.size == 0:
+            return img
+
+        flat = img.ravel().astype(np.float64)
+        lo, hi = np.percentile(flat, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return img
+
+        clipped = np.clip(flat, lo, hi)
+        hist, bin_edges = np.histogram(clipped, bins=512, range=(lo, hi))
+        cdf = hist.cumsum().astype(np.float64)
+        if cdf[-1] <= 0:
+            return img
+        cdf /= cdf[-1]
+
+        vals = np.interp(clipped, bin_edges[:-1], cdf)
+        return vals.reshape(img.shape).astype(np.float32)
+
+    @staticmethod
+    def _clahe_for_display(img: np.ndarray,
+                           tile_size: int = 32,
+                           clip_limit: float = 0.01,
+                           bins: int = 256) -> np.ndarray:
+        """Create a CLAHE-enhanced copy for display only."""
+        if img.size == 0:
+            return img
+
+        arr = img.astype(np.float64)
+        lo, hi = np.percentile(arr, [0.5, 99.5])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return img
+
+        arr = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        h, w = arr.shape
+        ny = int(np.ceil(h / tile_size))
+        nx = int(np.ceil(w / tile_size))
+        lut_map = np.zeros((ny, nx, bins), dtype=np.float64)
+
+        for ty in range(ny):
+            y0 = ty * tile_size
+            y1 = min((ty + 1) * tile_size, h)
+            for tx in range(nx):
+                x0 = tx * tile_size
+                x1 = min((tx + 1) * tile_size, w)
+                tile = arr[y0:y1, x0:x1]
+                hist, _ = np.histogram(tile, bins=bins, range=(0.0, 1.0))
+
+                max_count = max(int(clip_limit * tile.size), 1)
+                excess = np.maximum(hist - max_count, 0)
+                clipped = hist - excess
+                redistribute = int(excess.sum())
+                if redistribute > 0:
+                    q, r = divmod(redistribute, bins)
+                    clipped += q
+                    if r > 0:
+                        clipped[:r] += 1
+
+                cdf = clipped.cumsum().astype(np.float64)
+                if cdf[-1] > 0:
+                    cdf /= cdf[-1]
+                lut_map[ty, tx] = cdf
+
+        out = np.empty_like(arr, dtype=np.float64)
+        ys = np.arange(h)
+        xs = np.arange(w)
+        for y in ys:
+            gy = y / tile_size - 0.5
+            y0 = int(np.floor(gy))
+            y1 = y0 + 1
+            wy = gy - y0
+            y0 = min(max(y0, 0), ny - 1)
+            y1 = min(max(y1, 0), ny - 1)
+
+            row = arr[y]
+            bidx = np.minimum((row * (bins - 1)).astype(np.int32), bins - 1)
+            for x in xs:
+                gx = x / tile_size - 0.5
+                x0 = int(np.floor(gx))
+                x1 = x0 + 1
+                wx = gx - x0
+                x0 = min(max(x0, 0), nx - 1)
+                x1 = min(max(x1, 0), nx - 1)
+
+                v00 = lut_map[y0, x0, bidx[x]]
+                v10 = lut_map[y0, x1, bidx[x]]
+                v01 = lut_map[y1, x0, bidx[x]]
+                v11 = lut_map[y1, x1, bidx[x]]
+
+                top = (1.0 - wx) * v00 + wx * v10
+                bot = (1.0 - wx) * v01 + wx * v11
+                out[y, x] = (1.0 - wy) * top + wy * bot
+
+        return out.astype(np.float32)
+
     def _on_autostretch_toggle(self):
+        if self._autostretch_var.get():
+            self._histeq_var.set(False)
+            self._clahe_var.set(False)
         self._refresh_images()
         mode = "ON" if self._autostretch_var.get() else "OFF"
         self._status.set(f"Auto-stretch display {mode}.")
+
+    def _on_histeq_toggle(self):
+        if self._histeq_var.get():
+            self._autostretch_var.set(False)
+            self._clahe_var.set(False)
+        self._refresh_images()
+        mode = "ON" if self._histeq_var.get() else "OFF"
+        self._status.set(f"Histogram equalization display {mode}.")
+
+    def _on_clahe_toggle(self):
+        if self._clahe_var.get():
+            self._autostretch_var.set(False)
+            self._histeq_var.set(False)
+        self._refresh_images()
+        mode = "ON" if self._clahe_var.get() else "OFF"
+        self._status.set(f"CLAHE display {mode}.")
 
     # ── image display ──────────────────────────────────────────────────────────
 
@@ -1218,14 +1428,26 @@ class ColocalizationApp:
 
         if self.ch1 is not None:
             ch1_disp = self.ch1
-            if self._autostretch_var.get():
+            if self._clahe_var.get():
+                ch1_disp = self._clahe_for_display(self.ch1)
+                ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0.0, vmax=1.0)
+            elif self._histeq_var.get():
+                ch1_disp = self._histeq_for_display(self.ch1)
+                ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0.0, vmax=1.0)
+            elif self._autostretch_var.get():
                 ch1_disp = self._autostretch_for_display(self.ch1)
                 ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0.0, vmax=1.0)
             else:
                 ax0.imshow(ch1_disp, cmap=_CYAN, origin="upper", vmin=0, vmax=self.ch1.max())
         if self.ch2 is not None:
             ch2_disp = self.ch2
-            if self._autostretch_var.get():
+            if self._clahe_var.get():
+                ch2_disp = self._clahe_for_display(self.ch2)
+                ax1.imshow(ch2_disp, cmap=_MAGENTA, origin="upper", vmin=0.0, vmax=1.0)
+            elif self._histeq_var.get():
+                ch2_disp = self._histeq_for_display(self.ch2)
+                ax1.imshow(ch2_disp, cmap=_MAGENTA, origin="upper", vmin=0.0, vmax=1.0)
+            elif self._autostretch_var.get():
                 ch2_disp = self._autostretch_for_display(self.ch2)
                 ax1.imshow(ch2_disp, cmap=_MAGENTA, origin="upper", vmin=0.0, vmax=1.0)
             else:
@@ -1410,6 +1632,8 @@ class ColocalizationApp:
             c1 = self.ch1
             c2 = self.ch2
 
+        c1, c2 = self._apply_background_subtraction(c1, c2)
+
         if preprocess and self._despike_var.get():
             c1 = self._despike_hot_pixels(c1)
             c2 = self._despike_hot_pixels(c2)
@@ -1430,6 +1654,7 @@ class ColocalizationApp:
         if self._roi_kind == "lasso" and self.roi_mask is not None:
             c1_img = self.ch1
             c2_img = self.ch2
+            c1_img, c2_img = self._apply_background_subtraction(c1_img, c2_img)
             if preprocess and self._despike_var.get():
                 c1_img = self._despike_hot_pixels(c1_img)
                 c2_img = self._despike_hot_pixels(c2_img)
@@ -1793,6 +2018,11 @@ class ColocalizationApp:
             f"Costes sig={rand['significance']:.1f}%"
             + ("  |  Orthogonal reg" if self._orthreg_var.get() else "")
             + ("  |  hot-pixel preprocess ON" if use_preprocess else "")
+            + (
+                f"  |  BG sub Ch1={self._bg1_var.get()}, Ch2={self._bg2_var.get()}"
+                if (float(self._bg1_var.get()) > 0.0 or float(self._bg2_var.get()) > 0.0)
+                else ""
+            )
             + ("  (randomization disabled for lasso ROI)" if self._roi_kind == "lasso" else "")
         )
 
@@ -1834,6 +2064,11 @@ class ColocalizationApp:
             f"Manual thresholds applied  |  T₁={t1:.1f}  T₂={t2:.1f}  |  "
             f"M1={res['m1']:.3f}  M2={res['m2']:.3f}  "
             f"tM1={res['tm1']:.3f}  tM2={res['tm2']:.3f}"
+            + (
+                f"  |  BG sub Ch1={self._bg1_var.get()}, Ch2={self._bg2_var.get()}"
+                if (float(self._bg1_var.get()) > 0.0 or float(self._bg2_var.get()) > 0.0)
+                else ""
+            )
         )
 
     # ── plots ──────────────────────────────────────────────────────────────────
@@ -2038,6 +2273,7 @@ class ColocalizationApp:
                     f"Image shape: {self.ch1.shape}",
                     f"ROI: {roi_text}",
                     f"Costes regression: {'Orthogonal (TLS)' if self._orthreg_var.get() else 'Ordinary least squares'}",
+                    f"Background subtraction: Ch1={self._bg1_var.get()}  Ch2={self._bg2_var.get()}",
                     "",
                 ]
 
