@@ -2156,7 +2156,7 @@ class ColocalizationApp:
         xr = np.array([c1.min(), c1.max()])
         reg_label = "Orthogonal" if self._orthreg_var.get() else "OLS"
         ax_sc.plot(xr, slope * xr + intercept, color="tomato",
-                   linewidth=1.5, label=f"{reg_label} regression  a={slope:.3f}")
+                   linewidth=1.5, label=f"{reg_label} regression  a={slope:.3f}  b={intercept:.3f}")
 
         # threshold crosshairs
         ax_sc.axvline(t1, color=CYAN,    linewidth=1.5, linestyle="--",
