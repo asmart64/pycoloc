@@ -58,7 +58,7 @@ Given flattened pixel vectors `c1` and `c2`:
 2. Follow the Coloc2 stepping rule: step on `Ch1` when `-1 < a < 1`, otherwise step on `Ch2`
 3. Round each candidate threshold pair to integer image levels, matching Coloc2 behavior
 4. Compute Pearson `r` on the Costes background set `c1 < T1 OR c2 < T2`
-5. Stop using the Coloc2-style SimpleStepper criteria when background `r` becomes very small, non-finite, or starts increasing again
+5. Stop using the Coloc2-style SimpleStepper criteria when background `r` becomes very small, non-finite, or starts increasing again. An importante difference has been introduced with respect to the latter: the incremental ratio computed as r/r_previous is prone to statistical noise and that prompted unreasonable early stops. Now the search for T1 and T2 stops only if the relative increase of r with respect to the running minimum r value is larger then some percentage( e.g. 1%).
 
 This aligns the automatic threshold search more closely with Coloc2 instead of the earlier simplified scan.
 
