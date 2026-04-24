@@ -149,6 +149,7 @@ class ColocalizationApp:
         self._histeq_var = tk.BooleanVar(value=False)
         self._clahe_var = tk.BooleanVar(value=False)
         self._orthreg_var = tk.BooleanVar(value=True)
+        self._costes_debug_log_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -411,12 +412,39 @@ class ColocalizationApp:
             text="Orthogonal regression (Costes)",
             variable=self._orthreg_var,
         )
-        cb_orthreg.grid(row=3, column=0, columnspan=3, padx=3, pady=2, sticky=tk.W)
+        cb_orthreg.grid(row=3, column=0, columnspan=2, padx=3, pady=2, sticky=tk.W)
         self._attach_tooltip(
             cb_orthreg,
             "Use orthogonal (total least squares) regression instead of OLS "
             "when fitting the Ch2 vs Ch1 line for Costes thresholding. "
             "Minimises perpendicular distances rather than vertical residuals.",
+        )
+
+        debug_log_frame = ttk.Frame(outer)
+        debug_log_frame.grid(row=3, column=2, padx=3, pady=2, sticky=tk.W)
+
+        cb_costes_debug_log = ttk.Checkbutton(
+            debug_log_frame,
+            text="Debug Costes log",
+            variable=self._costes_debug_log_var,
+        )
+        cb_costes_debug_log.pack(side=tk.LEFT)
+        self._attach_tooltip(
+            cb_costes_debug_log,
+            "When enabled, write timestamped Costes regression/step/stop traces "
+            "to costes_threshold_debug.log for debugging only.",
+        )
+
+        btn_clear_costes_debug_log = ttk.Button(
+            debug_log_frame,
+            text="Clear",
+            width=7,
+            command=self._clear_costes_debug_log,
+        )
+        btn_clear_costes_debug_log.pack(side=tk.LEFT, padx=(6, 0))
+        self._attach_tooltip(
+            btn_clear_costes_debug_log,
+            "Delete costes_threshold_debug.log.",
         )
 
         btn_pdf = ttk.Button(outer, text="Save PDF Summary", command=self.save_pdf_summary, width=18)
@@ -1704,6 +1732,33 @@ class ColocalizationApp:
 
     # ── Costes algorithm ───────────────────────────────────────────────────────
 
+    def _costes_debug_log_path(self) -> Path:
+        return Path(__file__).resolve().parent / "costes_threshold_debug.log"
+
+    def _costes_debug_log_write(self, message: str):
+        """Append a timestamped line to the Costes debug log."""
+        if not self._costes_debug_log_var.get():
+            return
+        ts = datetime.now().isoformat(timespec="milliseconds")
+        try:
+            with self._costes_debug_log_path().open("a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] {message}\n")
+        except Exception:
+            # Logging must not interfere with analysis.
+            pass
+
+    def _clear_costes_debug_log(self):
+        """Delete the Costes debug log file used for troubleshooting runs."""
+        log_path = self._costes_debug_log_path()
+        try:
+            if log_path.exists():
+                log_path.unlink()
+                self._status.set("Costes debug log cleared.")
+            else:
+                self._status.set("Costes debug log is already empty.")
+        except Exception as exc:
+            self._status.set(f"Could not clear Costes debug log: {exc}")
+
     @staticmethod
     def _orthogonal_regression(c1: np.ndarray, c2: np.ndarray):
         """
@@ -1731,7 +1786,8 @@ class ColocalizationApp:
     @staticmethod
     def costes_threshold(c1: np.ndarray, c2: np.ndarray,
                          n_steps: int = 1024,
-                         orthogonal: bool = False):
+                         orthogonal: bool = False,
+                         debug_hook=None):
         """
         Costes automatic threshold algorithm (Costes et al., 2004).
 
@@ -1764,11 +1820,27 @@ class ColocalizationApp:
         curve_t1, curve_t2, curve_r : threshold-pair scan and Pearson r of
             below-threshold pixels at each step
         """
+        def _emit(msg: str):
+            if debug_hook is None:
+                return
+            try:
+                debug_hook(msg)
+            except Exception:
+                pass
+
         if orthogonal:
             slope, intercept = ColocalizationApp._orthogonal_regression(c1, c2)
+            reg_mode = "orthogonal"
         else:
             res = stats.linregress(c1, c2)
             slope, intercept = float(res.slope), float(res.intercept)
+            reg_mode = "ols"
+
+        _emit(
+            "REGRESSION "
+            f"mode={reg_mode} slope={slope:.8g} intercept={intercept:.8g} "
+            f"n_pixels={len(c1)}"
+        )
 
         max1, min1 = float(c1.max()), float(c1.min())
         max2, min2 = float(c2.max()), float(c2.min())
@@ -1783,11 +1855,22 @@ class ColocalizationApp:
         # Coloc2 behavior: step on Ch1 if -1 < slope < 1, otherwise on Ch2.
         step_on_ch1 = (-1.0 < slope < 1.0)
         work_t = max1 if step_on_ch1 else max2
+        if step_on_ch1:
+            _emit(
+                "STEP_AXIS driver=ch1 driven_threshold=T1 paired_threshold=T2 "
+                f"rule='-1 < slope < 1' slope={slope:.8g} start_work_t={work_t:.6g}"
+            )
+        else:
+            _emit(
+                "STEP_AXIS driver=ch2 driven_threshold=T2 paired_threshold=T1 "
+                f"rule='slope <= -1 or slope >= 1' slope={slope:.8g} start_work_t={work_t:.6g}"
+            )
 
         # Coloc2 SimpleStepper defaults.
         current_r = 1.0
         last_r = float("inf")
         finished = False
+        step_idx = 0
 
         while not finished:
             if step_on_ch1:
@@ -1819,6 +1902,12 @@ class ColocalizationApp:
             curve_t2.append(t2_cand)
             curve_r.append(r)
 
+            _emit(
+                "STEP "
+                f"idx={step_idx} work_t={work_t:.6g} t1={t1_cand:.6g} t2={t2_cand:.6g} "
+                f"mask_n={int(mask.sum())} r={r:.8g} prev_r={last_r:.8g}"
+            )
+
             if np.isfinite(r) and r < best_r_any:
                 best_r_any = r
                 t1_opt_any = t1_cand
@@ -1831,17 +1920,39 @@ class ColocalizationApp:
             # Emulate Coloc2 SimpleStepper update() and termination criteria.
             last_r, current_r = current_r, r
             next_work_t = work_t - 1.0
-            finished = (
-                (not np.isfinite(r)) or
-                (next_work_t < 1.0) or
-                (r < 0.0001) or
-                (r > last_r)
-            )
+            stop_reasons = []
+            if not np.isfinite(r):
+                stop_reasons.append("non_finite_r")
+            if next_work_t < 1.0:
+                stop_reasons.append("next_work_t_below_1")
+            if np.isfinite(r) and r < 0.0001:
+                stop_reasons.append("r_below_0.0001")
+            if np.isfinite(last_r) and np.isfinite(r) and r > last_r:
+                stop_reasons.append("r_increasing")
+            finished = bool(stop_reasons)
+            if finished:
+                _emit(
+                    "STOP "
+                    f"idx={step_idx} reasons={','.join(stop_reasons)} "
+                    f"final_t1={t1_cand:.6g} final_t2={t2_cand:.6g} final_r={r:.8g} "
+                    f"next_work_t={next_work_t:.6g}"
+                )
             work_t = next_work_t
+            step_idx += 1
 
         # Fallback: if all evaluated r were non-finite, keep conservative defaults.
         if not np.isfinite(best_r_any):
             t1_opt, t2_opt = t1_opt_any, t2_opt_any
+            _emit(
+                "FALLBACK all_r_non_finite=true "
+                f"fallback_t1={t1_opt:.6g} fallback_t2={t2_opt:.6g}"
+            )
+
+        _emit(
+            "RESULT "
+            f"t1={t1_opt:.6g} t2={t2_opt:.6g} best_r_any={best_r_any:.8g} "
+            f"curve_len={len(curve_t1)}"
+        )
 
         return (
             t1_opt, t2_opt,
@@ -2046,9 +2157,22 @@ class ColocalizationApp:
         self._status.set("Running Costes algorithm…")
         self.root.update_idletasks()
 
+        debug_hook = self._costes_debug_log_write if self._costes_debug_log_var.get() else None
+        if debug_hook is not None:
+            debug_hook(
+                "RUN_START "
+                f"orthogonal={self._orthreg_var.get()} preprocess_hot_pixels={use_preprocess} "
+                f"roi_kind={self._roi_kind if self._roi_kind else 'full'} n_pixels={len(c1)}"
+            )
+
         t1, t2, slope, intercept, curve_t1, curve_t2, curve_r = self.costes_threshold(
-            c1, c2, orthogonal=self._orthreg_var.get()
+            c1, c2, orthogonal=self._orthreg_var.get(), debug_hook=debug_hook
         )
+        if debug_hook is not None:
+            debug_hook(
+                "RUN_END "
+                f"t1={t1:.6g} t2={t2:.6g} slope={slope:.8g} intercept={intercept:.8g}"
+            )
         self._last_costes_slope = slope
         self._last_costes_intercept = intercept
         self._last_costes_curve_t1 = curve_t1

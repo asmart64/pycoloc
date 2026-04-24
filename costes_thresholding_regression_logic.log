@@ -1,0 +1,134 @@
+Costes Thresholding Regression and Logic Log
+Generated: 2026-04-24
+Source: colocalization_app.py
+
+Purpose
+- Document the exact regression and threshold stepping logic used by the current Costes threshold implementation.
+- Capture the sequence of operations and stop criteria used to select threshold pair (T1, T2).
+
+Inputs
+- c1: flattened channel 1 intensities
+- c2: flattened channel 2 intensities
+- orthogonal: if true use orthogonal regression, otherwise OLS
+
+Regression Stage
+1) If orthogonal == true:
+   - Use total least squares via _orthogonal_regression(c1, c2).
+   - Compute centered scatter terms:
+     sxx = sum((x - mean(x))^2)
+     sxy = sum((x - mean(x)) * (y - mean(y)))
+     syy = sum((y - mean(y))^2)
+   - Slope b:
+     b = (syy - sxx + sqrt((syy - sxx)^2 + 4*sxy^2)) / (2*sxy), if abs(sxy) > 1e-12
+     fallback when abs(sxy) <= 1e-12:
+       b = 1.0 if syy >= sxx else 0.0
+   - Intercept a:
+     a = mean(y) - b * mean(x)
+   - Returned as (slope, intercept) = (b, a)
+
+2) If orthogonal == false:
+   - Use scipy.stats.linregress(c1, c2)
+   - slope = res.slope
+   - intercept = res.intercept
+
+Threshold Search Initialization
+3) Compute intensity bounds:
+   - max1 = max(c1), min1 = min(c1)
+   - max2 = max(c2), min2 = min(c2)
+
+4) Initialize tracking arrays:
+   - curve_t1 = []
+   - curve_t2 = []
+   - curve_r = []
+
+5) Initialize defaults:
+   - best_r_any = +inf
+   - t1_opt = percentile(c1, 95)
+   - t2_opt = clip(slope * t1_opt + intercept, min2, max2)
+   - t1_opt_any = t1_opt
+   - t2_opt_any = t2_opt
+
+6) Select stepping axis (Coloc2-style rule):
+   - step_on_ch1 = (-1.0 < slope < 1.0)
+   - work_t = max1 if step_on_ch1 else max2
+
+7) Stepper state defaults:
+   - current_r = 1.0
+   - last_r = +inf
+   - finished = false
+
+Main Iteration Loop (SimpleStepper Emulation)
+8) While finished == false:
+
+   Candidate threshold pair generation
+   - If step_on_ch1:
+     t1_raw = work_t
+     t2_raw = slope * work_t + intercept
+   - Else (step on ch2):
+     t2_raw = work_t
+     if abs(slope) < 1e-12:
+       t1_raw = max1
+     else:
+       t1_raw = (work_t - intercept) / slope
+
+   Integer threshold rounding and clipping (Coloc2 behavior)
+   - t1_cand = clip(floor(t1_raw + 0.5), min1, max1)
+   - t2_cand = clip(floor(t2_raw + 0.5), min2, max2)
+
+   Background mask for Costes correlation (ThresholdMode.Below union)
+   - mask = (c1 < t1_cand) OR (c2 < t2_cand)
+
+   Pearson computation on background pixels
+   - If mask pixel count >= 3:
+     c1b = c1[mask], c2b = c2[mask]
+     - If std(c1b) >= 1e-9 and std(c2b) >= 1e-9:
+       r = pearsonr(c1b, c2b)
+     - Else:
+       r = NaN
+   - Else:
+     r = NaN
+
+   Append scan history
+   - curve_t1.append(t1_cand)
+   - curve_t2.append(t2_cand)
+   - curve_r.append(r)
+
+   Track best finite r observed
+   - If r is finite and r < best_r_any:
+     best_r_any = r
+     t1_opt_any = t1_cand
+     t2_opt_any = t2_cand
+
+   Current output threshold update
+   - t1_opt = t1_cand
+   - t2_opt = t2_cand
+
+   SimpleStepper-style update and termination check
+   - last_r, current_r = current_r, r
+   - next_work_t = work_t - 1.0
+   - finished = (
+       (r is not finite) OR
+       (next_work_t < 1.0) OR
+       (r < 0.0001) OR
+       (r > last_r)
+     )
+   - work_t = next_work_t
+
+Finalization
+9) Fallback if all evaluated r were non-finite:
+   - if best_r_any is not finite:
+       t1_opt = t1_opt_any
+       t2_opt = t2_opt_any
+
+10) Return values:
+   - t1_opt, t2_opt
+   - slope, intercept
+   - curve_t1, curve_t2, curve_r as numpy arrays
+
+Operational Notes
+- This implementation evaluates Pearson r on below-threshold union pixels:
+  (c1 < T1) OR (c2 < T2).
+- Threshold stepping is one intensity unit at a time along one active axis.
+- Rounding uses floor(x + 0.5), then clips to channel min/max.
+- The displayed Costes curve is based on curve_t1 vs curve_r, with paired curve_t2 values tracked in parallel.
+- In the current pipeline, returned thresholds are used for Manders metrics and plotting, then Costes randomization is run as a separate step.
