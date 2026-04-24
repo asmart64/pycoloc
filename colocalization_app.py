@@ -1790,6 +1790,9 @@ class ColocalizationApp:
         for coll in list(ax1.collections):
             if getattr(coll, "_roi_mask_overlay", False):
                 coll.remove()
+        for art in list(ax1.artists):
+            if getattr(art, "_roi_mask_overlay", False):
+                art.remove()
         if self._roi_kind == "rect" and self.roi is not None:
             x1, y1, x2, y2 = self.roi
             ax1.add_patch(Rectangle(
@@ -1804,15 +1807,23 @@ class ColocalizationApp:
         self._img_canvas.draw_idle()
 
     def _add_mask_outline(self, ax, mask: np.ndarray):
-        contour = ax.contour(
+        before_colls = {id(c) for c in ax.collections}
+        before_arts  = {id(a) for a in ax.artists}
+        h, w = mask.shape
+        ax.contour(
+            np.arange(w),
+            np.arange(h),
             mask.astype(float),
             levels=[0.5],
             colors=[YELLOW],
             linewidths=2,
-            origin="upper",
         )
-        for coll in contour.collections:
-            coll._roi_mask_overlay = True
+        for c in ax.collections:
+            if id(c) not in before_colls:
+                c._roi_mask_overlay = True
+        for a in ax.artists:
+            if id(a) not in before_arts:
+                a._roi_mask_overlay = True
 
     # ── data extraction ────────────────────────────────────────────────────────
 
@@ -2165,16 +2176,28 @@ class ColocalizationApp:
                 f"fallback_t1={t1_opt:.6g} fallback_t2={t2_opt:.6g}"
             )
 
+        # Trim the curves to the last step where r was still >= 0.0001, so the
+        # plot does not show the final bad (negative / NaN) step.
+        arr_t1 = np.asarray(curve_t1)
+        arr_t2 = np.asarray(curve_t2)
+        arr_r  = np.asarray(curve_r)
+        ok_idx = np.where(np.isfinite(arr_r) & (arr_r >= 0.0001))[0]
+        if ok_idx.size > 0:
+            last_ok_idx = int(ok_idx[-1]) + 1   # keep up to and including that step
+            arr_t1 = arr_t1[:last_ok_idx]
+            arr_t2 = arr_t2[:last_ok_idx]
+            arr_r  = arr_r[:last_ok_idx]
+
         _emit(
             "RESULT "
             f"t1={t1_opt:.6g} t2={t2_opt:.6g} best_r_any={best_r_any:.8g} "
-            f"curve_len={len(curve_t1)}"
+            f"curve_len={len(arr_t1)}"
         )
 
         return (
             t1_opt, t2_opt,
             slope, intercept,
-            np.asarray(curve_t1), np.asarray(curve_t2), np.asarray(curve_r),
+            arr_t1, arr_t2, arr_r,
         )
 
     # ── Mander's coefficients ──────────────────────────────────────────────────
@@ -2355,7 +2378,7 @@ class ColocalizationApp:
     def run_analysis(self):
         use_preprocess = self._despike_var.get()
 
-        if self._roi_kind == "lasso":
+        if self._roi_kind in {"lasso", "mask"}:
             c1, c2 = self._get_pixels(preprocess=use_preprocess)
             c1_img = None
             c2_img = None
@@ -2680,10 +2703,11 @@ class ColocalizationApp:
         if not out_path.lower().endswith(".pdf"):
             out_path += ".pdf"
 
-        if self._roi_kind == "lasso" and self.roi_mask is not None and self.roi is not None:
+        if self._roi_kind in {"lasso", "mask"} and self.roi_mask is not None and self.roi is not None:
             x1, y1, x2, y2 = self.roi
+            kind_label = "Lasso" if self._roi_kind == "lasso" else "Mask"
             roi_text = (
-                f"Lasso ({int(self.roi_mask.sum())} px), bbox: x=[{x1}, {x2}], y=[{y1}, {y2}]"
+                f"{kind_label} ({int(self.roi_mask.sum())} px), bbox: x=[{x1}, {x2}], y=[{y1}, {y2}]"
             )
         elif self.roi is None:
             roi_text = "Full image"
