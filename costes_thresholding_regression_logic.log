@@ -10,6 +10,8 @@ Inputs
 - c1: flattened channel 1 intensities
 - c2: flattened channel 2 intensities
 - orthogonal: if true use orthogonal regression, otherwise OLS
+- rise_stop_fraction: fractional threshold derived from GUI field
+  "Costes rise stop (% over min r)"
 
 Regression Stage
 1) If orthogonal == true:
@@ -55,6 +57,7 @@ Threshold Search Initialization
 7) Stepper state defaults:
    - current_r = 1.0
    - last_r = +inf
+  - min_r_seen = +inf
    - finished = false
 
 Main Iteration Loop (SimpleStepper Emulation)
@@ -99,6 +102,10 @@ Main Iteration Loop (SimpleStepper Emulation)
      t1_opt_any = t1_cand
      t2_opt_any = t2_cand
 
+   Track running minimum r
+   - If r is finite and r < min_r_seen:
+     min_r_seen = r
+
    Current output threshold update
    - t1_opt = t1_cand
    - t2_opt = t2_cand
@@ -106,11 +113,12 @@ Main Iteration Loop (SimpleStepper Emulation)
    SimpleStepper-style update and termination check
    - last_r, current_r = current_r, r
    - next_work_t = work_t - 1.0
+   - min_r_excess = rise_stop_fraction * abs(min_r_seen)
    - finished = (
        (r is not finite) OR
        (next_work_t < 1.0) OR
        (r < 0.0001) OR
-       (r > last_r)
+       ((r - min_r_seen) > min_r_excess)
      )
    - work_t = next_work_t
 
@@ -130,5 +138,10 @@ Operational Notes
   (c1 < T1) OR (c2 < T2).
 - Threshold stepping is one intensity unit at a time along one active axis.
 - Rounding uses floor(x + 0.5), then clips to channel min/max.
+- The rise-stop percentage is user-configurable in the GUI through the field
+  "Costes rise stop (% over min r)".
+- The loop stops when the current finite r exceeds the running minimum finite r
+  by more than the configured percentage; this supersedes the older rule based
+  on comparing r to the immediately previous step.
 - The displayed Costes curve is based on curve_t1 vs curve_r, with paired curve_t2 values tracked in parallel.
 - In the current pipeline, returned thresholds are used for Manders metrics and plotting, then Costes randomization is run as a separate step.

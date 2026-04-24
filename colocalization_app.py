@@ -150,6 +150,7 @@ class ColocalizationApp:
         self._clahe_var = tk.BooleanVar(value=False)
         self._orthreg_var = tk.BooleanVar(value=True)
         self._costes_debug_log_var = tk.BooleanVar(value=False)
+        self._costes_stop_pct_var = tk.StringVar(value="1.0")
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -795,26 +796,35 @@ class ColocalizationApp:
         self._entry_psf.bind("<Return>", lambda e: self._on_psf_change())
         self._entry_psf.bind("<FocusOut>", lambda e: self._on_psf_change())
 
-        ttk.Label(parent, text="Background Ch1:").grid(
+        ttk.Label(parent, text="Costes rise stop (% over min r):").grid(
             row=3, column=0, padx=6, sticky=tk.W, pady=3)
+        self._entry_costes_stop_pct = ttk.Entry(parent, textvariable=self._costes_stop_pct_var, width=9)
+        self._entry_costes_stop_pct.grid(row=3, column=1, padx=4, sticky=tk.W)
+        self._entry_costes_stop_pct.bind("<Return>", lambda e: self._on_costes_stop_pct_change())
+        self._entry_costes_stop_pct.bind("<FocusOut>", lambda e: self._on_costes_stop_pct_change())
+
+        ttk.Label(parent, text="Background Ch1:").grid(
+            row=4, column=0, padx=6, sticky=tk.W, pady=3)
         self._entry_bg1 = ttk.Entry(parent, textvariable=self._bg1_var, width=9)
-        self._entry_bg1.grid(row=3, column=1, padx=4, sticky=tk.W)
+        self._entry_bg1.grid(row=4, column=1, padx=4, sticky=tk.W)
         self._entry_bg1.bind("<Return>", lambda e: self._on_background_change())
         self._entry_bg1.bind("<FocusOut>", lambda e: self._on_background_change())
 
         ttk.Label(parent, text="Background Ch2:").grid(
-            row=4, column=0, padx=6, sticky=tk.W, pady=3)
+            row=5, column=0, padx=6, sticky=tk.W, pady=3)
         self._entry_bg2 = ttk.Entry(parent, textvariable=self._bg2_var, width=9)
-        self._entry_bg2.grid(row=4, column=1, padx=4, sticky=tk.W)
+        self._entry_bg2.grid(row=5, column=1, padx=4, sticky=tk.W)
         self._entry_bg2.bind("<Return>", lambda e: self._on_background_change())
         self._entry_bg2.bind("<FocusOut>", lambda e: self._on_background_change())
 
+        ttk.Button(parent, text="Apply Stop", command=self._on_costes_stop_pct_change).grid(
+            row=3, column=2, padx=8, sticky=tk.NS)
         ttk.Button(parent, text="Apply BG", command=self._on_background_change).grid(
-            row=3, column=2, rowspan=2, padx=8, sticky=tk.NS)
+            row=4, column=2, rowspan=2, padx=8, sticky=tk.NS)
 
         ttk.Label(parent, text="(press Enter or Tab to apply typed value)",
                   foreground=GRAY, font=("TkDefaultFont", 8)).grid(
-            row=5, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 2))
+            row=6, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 2))
 
         parent.columnconfigure(1, weight=1)
 
@@ -830,6 +840,18 @@ class ColocalizationApp:
         self._psf_var.set(f"{psf_px:.1f}")
         return int(round(psf_px))
 
+    def _get_costes_rise_stop_fraction(self) -> float:
+        """Get the Costes rise-stop threshold as a fractional value."""
+        try:
+            pct = float(self._costes_stop_pct_var.get())
+        except ValueError:
+            pct = 1.0
+        if not np.isfinite(pct):
+            pct = 1.0
+        pct = max(0.0, pct)
+        self._costes_stop_pct_var.set(f"{pct:.2f}")
+        return pct / 100.0
+
     def _on_psf_change(self):
         """Apply PSF edits and re-run analysis when images are loaded."""
         self._get_psf_block_size()  # sanitize and normalize field formatting
@@ -838,6 +860,20 @@ class ColocalizationApp:
             return
 
         self._status.set("PSF updated - rerunning analysis...")
+        self.root.update_idletasks()
+        self.run_analysis()
+
+    def _on_costes_stop_pct_change(self):
+        """Apply Costes rise-stop edits and re-run analysis when images are loaded."""
+        stop_pct = 100.0 * self._get_costes_rise_stop_fraction()
+
+        if self.ch1 is None or self.ch2 is None:
+            self._status.set(f"Costes rise stop set to {stop_pct:.2f}% over min r.")
+            return
+
+        self._status.set(
+            f"Costes rise stop set to {stop_pct:.2f}% over min r - rerunning analysis..."
+        )
         self.root.update_idletasks()
         self.run_analysis()
 
@@ -1787,7 +1823,8 @@ class ColocalizationApp:
     def costes_threshold(c1: np.ndarray, c2: np.ndarray,
                          n_steps: int = 1024,
                          orthogonal: bool = False,
-                         debug_hook=None):
+                         debug_hook=None,
+                         rise_stop_fraction: float = 0.01):
         """
         Costes automatic threshold algorithm (Costes et al., 2004).
 
@@ -1804,7 +1841,8 @@ class ColocalizationApp:
            pixels; they should be uncorrelated (r ≤ 0) when the threshold
            sits above all real signal.
           4. Stop when r_background becomes very small (< 1e-4), becomes NaN,
-              or starts increasing again; this mirrors Coloc2's stopping rule.
+              or rises above the running minimum r by at least the configured
+              percentage.
 
         Parameters
         ----------
@@ -1839,7 +1877,7 @@ class ColocalizationApp:
         _emit(
             "REGRESSION "
             f"mode={reg_mode} slope={slope:.8g} intercept={intercept:.8g} "
-            f"n_pixels={len(c1)}"
+            f"n_pixels={len(c1)} rise_stop_fraction={rise_stop_fraction:.8g}"
         )
 
         max1, min1 = float(c1.max()), float(c1.min())
@@ -1871,6 +1909,7 @@ class ColocalizationApp:
         last_r = float("inf")
         finished = False
         step_idx = 0
+        min_r_seen = float("inf")
 
         while not finished:
             if step_on_ch1:
@@ -1905,13 +1944,16 @@ class ColocalizationApp:
             _emit(
                 "STEP "
                 f"idx={step_idx} work_t={work_t:.6g} t1={t1_cand:.6g} t2={t2_cand:.6g} "
-                f"mask_n={int(mask.sum())} r={r:.8g} prev_r={last_r:.8g}"
+                f"mask_n={int(mask.sum())} r={r:.8g} prev_r={last_r:.8g} min_r={min_r_seen:.8g}"
             )
 
             if np.isfinite(r) and r < best_r_any:
                 best_r_any = r
                 t1_opt_any = t1_cand
                 t2_opt_any = t2_cand
+
+            if np.isfinite(r) and r < min_r_seen:
+                min_r_seen = r
 
             # Store the current candidate as the stepper output threshold.
             t1_opt = t1_cand
@@ -1927,15 +1969,16 @@ class ColocalizationApp:
                 stop_reasons.append("next_work_t_below_1")
             if np.isfinite(r) and r < 0.0001:
                 stop_reasons.append("r_below_0.0001")
-            if np.isfinite(last_r) and np.isfinite(r) and r > last_r:
-                stop_reasons.append("r_increasing")
+            min_r_excess = rise_stop_fraction * abs(min_r_seen) if np.isfinite(min_r_seen) else float("inf")
+            if np.isfinite(min_r_seen) and np.isfinite(r) and (r - min_r_seen) > min_r_excess:
+                stop_reasons.append("r_above_min_r")
             finished = bool(stop_reasons)
             if finished:
                 _emit(
                     "STOP "
                     f"idx={step_idx} reasons={','.join(stop_reasons)} "
                     f"final_t1={t1_cand:.6g} final_t2={t2_cand:.6g} final_r={r:.8g} "
-                    f"next_work_t={next_work_t:.6g}"
+                    f"min_r={min_r_seen:.8g} next_work_t={next_work_t:.6g}"
                 )
             work_t = next_work_t
             step_idx += 1
@@ -2158,15 +2201,20 @@ class ColocalizationApp:
         self.root.update_idletasks()
 
         debug_hook = self._costes_debug_log_write if self._costes_debug_log_var.get() else None
+        rise_stop_fraction = self._get_costes_rise_stop_fraction()
         if debug_hook is not None:
             debug_hook(
                 "RUN_START "
                 f"orthogonal={self._orthreg_var.get()} preprocess_hot_pixels={use_preprocess} "
-                f"roi_kind={self._roi_kind if self._roi_kind else 'full'} n_pixels={len(c1)}"
+                f"roi_kind={self._roi_kind if self._roi_kind else 'full'} n_pixels={len(c1)} "
+                f"rise_stop_pct={100.0 * rise_stop_fraction:.4f}"
             )
 
         t1, t2, slope, intercept, curve_t1, curve_t2, curve_r = self.costes_threshold(
-            c1, c2, orthogonal=self._orthreg_var.get(), debug_hook=debug_hook
+            c1, c2,
+            orthogonal=self._orthreg_var.get(),
+            debug_hook=debug_hook,
+            rise_stop_fraction=rise_stop_fraction,
         )
         if debug_hook is not None:
             debug_hook(
