@@ -26,6 +26,7 @@ It includes:
 - Loading of two single-channel images (TIFF, PNG, JPEG, BMP; 8-bit or 16-bit)
 - Synthetic demo datasets for quick testing of different overlap regimes
 - Interactive rectangular or freehand (lasso) ROI drawing on Ch1, mirrored on Ch2
+- ROI mask import/export for file-based region definitions
 - Costes threshold estimation by scanning threshold pairs along regression
 - Manders and related overlap metrics at both auto and manual thresholds
 - Costes randomization test (block shuffling, PSF-like block size)
@@ -47,8 +48,9 @@ It includes:
 
 - **Rectangle mode**: draw and interactively resize a rectangular ROI on Channel 1; mirrored on Channel 2
 - **Lasso mode**: freehand polygon ROI for arbitrary region selection
+- **Mask file workflow**: load a binary mask image as ROI or save the current ROI to a new mask file
 - Clear ROI to revert analysis to the full image
-- Costes randomization supports both rectangular and lasso ROIs
+- Costes randomization supports rectangular, lasso, and file-loaded mask ROIs
 
 ### 3) Costes automatic thresholding
 
@@ -138,7 +140,7 @@ python colocalization_app.py
 ## Typical workflow
 
 1. Load Channel 1 and Channel 2 (or load a demo set)
-2. Optionally draw/refine a rectangular or lasso ROI on Channel 1
+2. Optionally draw/refine a rectangular or lasso ROI on Channel 1, or load a mask file as ROI
 3. Click **Run Costes + Analyze**
 4. Inspect thresholds, coefficients, and randomization significance in the Results tab
 5. Optionally tweak manual thresholds to compare outcomes
@@ -149,7 +151,7 @@ python colocalization_app.py
 - Both channels must have the same spatial dimensions.
 - For TIFF export and optimal TIFF loading, `tifffile` is recommended.
 - Randomization block size is controlled by the PSF field (in pixels).
-- For lasso ROI, Costes randomization is evaluated inside the lasso bounding box but only masked lasso pixels contribute to Pearson statistics.
+- For lasso and file-loaded mask ROIs, Costes randomization is evaluated on masked pixels only.
 - All three windows must remain open for full functionality; closing any one exits the app.
 
 ## Repository layout

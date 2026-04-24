@@ -360,9 +360,17 @@ class ColocalizationApp:
         btn_clear_roi.grid(row=1, column=3, padx=3, pady=2)
         self._attach_tooltip(btn_clear_roi, "Remove ROI and use full image")
 
+        btn_load_roi_mask = ttk.Button(outer, text="Load ROI Mask", command=self.load_roi_mask, width=14)
+        btn_load_roi_mask.grid(row=1, column=4, padx=3, pady=2)
+        self._attach_tooltip(btn_load_roi_mask, "Load a binary mask file and use it as ROI")
+
+        btn_save_roi_mask = ttk.Button(outer, text="Save ROI Mask", command=self.save_roi_mask, width=14)
+        btn_save_roi_mask.grid(row=1, column=5, padx=3, pady=2)
+        self._attach_tooltip(btn_save_roi_mask, "Save the current ROI as a binary mask image")
+
         btn_run = ttk.Button(outer, text="Run Costes + Analyze", command=self.run_analysis, width=18)
         btn_run.configure(style="Analyze.TButton")
-        btn_run.grid(row=1, column=4, padx=3, pady=2)
+        btn_run.grid(row=1, column=6, padx=3, pady=2)
         self._attach_tooltip(btn_run, "Compute thresholds and colocalization metrics")
 
         # Row 2
@@ -953,6 +961,11 @@ class ColocalizationApp:
         if not path:
             return None
 
+        return self._read_image_file(path)
+
+    def _read_image_file(self, path: str):
+        path = str(path)
+
         # ── try tifffile first (best for microscopy TIFFs) ──────────────────
         if _HAS_TIFFFILE and path.lower().endswith((".tif", ".tiff")):
             try:
@@ -1063,8 +1076,134 @@ class ColocalizationApp:
         self.roi_polygon = None
         self.roi_mask = None
         self._roi_kind = None
+        if hasattr(self, "_roi_sel"):
+            self._roi_sel.clear()
         self._refresh_images()
         self._sync_slider_range()
+
+    def _mask_to_roi_bounds(self, mask: np.ndarray):
+        ys, xs = np.where(mask)
+        return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+    def _apply_mask_roi(self, mask: np.ndarray, source: str):
+        if self.ch1 is None:
+            messagebox.showwarning("No image", "Load Channel 1 before using an ROI mask.")
+            return False
+
+        if mask.shape != self.ch1.shape[:2]:
+            messagebox.showerror(
+                "Mask size mismatch",
+                "The ROI mask must match the loaded image size.\n"
+                f"Mask: {mask.shape}   Ch1: {self.ch1.shape[:2]}",
+            )
+            return False
+
+        n_sel = int(mask.sum())
+        if n_sel == 0:
+            messagebox.showerror("Empty mask", "The selected ROI mask does not contain any non-zero pixels.")
+            return False
+
+        self.roi = self._mask_to_roi_bounds(mask)
+        self.roi_polygon = None
+        self.roi_mask = mask
+        self._roi_kind = "mask"
+        self._roi_active = False
+        self._set_roi_selector_active()
+        self._roi_sel.clear()
+        self._roi_btn.config(text="Draw ROI")
+        self._refresh_images()
+        self._status.set(f"ROI mask loaded from {source} ({n_sel} pixels).")
+        return True
+
+    def _current_roi_mask_image(self):
+        if self.ch1 is None:
+            return None
+
+        h, w = self.ch1.shape[:2]
+        mask = np.zeros((h, w), dtype=bool)
+
+        if self._roi_kind in {"lasso", "mask"} and self.roi_mask is not None:
+            if self.roi_mask.shape != (h, w):
+                return None
+            return self.roi_mask.astype(bool, copy=True)
+
+        if self._roi_kind == "rect" and self.roi is not None:
+            x1, y1, x2, y2 = self.roi
+            mask[y1:y2, x1:x2] = True
+            return mask
+
+        return None
+
+    def load_roi_mask(self):
+        if self.ch1 is None:
+            messagebox.showwarning("No image", "Load Channel 1 before loading an ROI mask.")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Open ROI Mask",
+            filetypes=[
+                ("Images", "*.tif *.tiff *.png *.jpg *.jpeg *.bmp"),
+                ("TIFF", "*.tif *.tiff"),
+                ("All", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        img = self._read_image_file(path)
+        if img is None:
+            return
+
+        mask = np.asarray(img) > 0
+        self._apply_mask_roi(mask, Path(path).name)
+
+    def save_roi_mask(self):
+        if self.ch1 is None:
+            messagebox.showwarning("No image", "Load Channel 1 before saving an ROI mask.")
+            return
+
+        mask = self._current_roi_mask_image()
+        if mask is None or not np.any(mask):
+            messagebox.showwarning("No ROI", "Define or load an ROI before saving a mask.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Save ROI Mask",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG", "*.png"),
+                ("TIFF", "*.tif *.tiff"),
+                ("BMP", "*.bmp"),
+                ("All", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        out = (mask.astype(np.uint8) * 255)
+        suffix = Path(path).suffix.lower()
+        try:
+            if suffix in {".tif", ".tiff"}:
+                if not _HAS_TIFFFILE:
+                    messagebox.showerror(
+                        "Missing dependency",
+                        "TIFF export requires tifffile. Install with: pip install tifffile",
+                    )
+                    return
+                tifffile.imwrite(path, out)
+            else:
+                if not _HAS_PIL:
+                    messagebox.showerror(
+                        "Missing dependency",
+                        "PNG/BMP export requires Pillow. Install with: pip install Pillow",
+                    )
+                    return
+                Image.fromarray(out, mode="L").save(path)
+        except Exception as exc:
+            messagebox.showerror("Save error", str(exc))
+            return
+
+        self._status.set(f"ROI mask saved to {Path(path).name}.")
 
     @staticmethod
     def _generate_demo_images(shape: tuple[int, int] = (256, 256),
@@ -1539,6 +1678,10 @@ class ColocalizationApp:
             ax1.add_patch(Polygon(self.roi_polygon, closed=True, fill=False,
                                   edgecolor=YELLOW, linewidth=2))
 
+        if self._roi_kind == "mask" and self.roi_mask is not None:
+            self._add_mask_outline(ax0, self.roi_mask)
+            self._add_mask_outline(ax1, self.roi_mask)
+
         for ax in self._img_axes:
             ax.axis("off")
         self._img_fig.tight_layout(pad=1.2)
@@ -1644,6 +1787,9 @@ class ColocalizationApp:
         ax1 = self._img_axes[1]
         for p in list(ax1.patches):
             p.remove()
+        for coll in list(ax1.collections):
+            if getattr(coll, "_roi_mask_overlay", False):
+                coll.remove()
         if self._roi_kind == "rect" and self.roi is not None:
             x1, y1, x2, y2 = self.roi
             ax1.add_patch(Rectangle(
@@ -1653,7 +1799,20 @@ class ColocalizationApp:
         elif self._roi_kind == "lasso" and self.roi_polygon is not None:
             ax1.add_patch(Polygon(self.roi_polygon, closed=True, fill=False,
                                   edgecolor=YELLOW, linewidth=2))
+        elif self._roi_kind == "mask" and self.roi_mask is not None:
+            self._add_mask_outline(ax1, self.roi_mask)
         self._img_canvas.draw_idle()
+
+    def _add_mask_outline(self, ax, mask: np.ndarray):
+        contour = ax.contour(
+            mask.astype(float),
+            levels=[0.5],
+            colors=[YELLOW],
+            linewidths=2,
+            origin="upper",
+        )
+        for coll in contour.collections:
+            coll._roi_mask_overlay = True
 
     # ── data extraction ────────────────────────────────────────────────────────
 
@@ -1716,7 +1875,7 @@ class ColocalizationApp:
             )
             return None, None
 
-        if self._roi_kind == "lasso" and self.roi_mask is not None:
+        if self._roi_kind in {"lasso", "mask"} and self.roi_mask is not None:
             c1_img = self.ch1
             c2_img = self.ch2
             c1_img, c2_img = self._apply_background_subtraction(c1_img, c2_img)
@@ -1745,7 +1904,7 @@ class ColocalizationApp:
             )
             return None, None, None
 
-        if self._roi_kind == "lasso" and self.roi_mask is not None:
+        if self._roi_kind in {"lasso", "mask"} and self.roi_mask is not None:
             c1_img = self.ch1
             c2_img = self.ch2
             roi_mask = self.roi_mask
@@ -1910,6 +2069,11 @@ class ColocalizationApp:
         finished = False
         step_idx = 0
         min_r_seen = float("inf")
+        # Track the last step where r was still >= 0.0001 (above the noise floor).
+        # When we stop for any reason, this is what we return as the threshold.
+        last_ok_t1 = t1_opt
+        last_ok_t2 = t2_opt
+        last_ok_r = float("nan")
 
         while not finished:
             if step_on_ch1:
@@ -1955,9 +2119,13 @@ class ColocalizationApp:
             if np.isfinite(r) and r < min_r_seen:
                 min_r_seen = r
 
-            # Store the current candidate as the stepper output threshold.
-            t1_opt = t1_cand
-            t2_opt = t2_cand
+            # Keep a running record of the last step where r was still above
+            # the noise floor (>= 0.0001).  This is the threshold we will
+            # return regardless of which stop condition fires.
+            if np.isfinite(r) and r >= 0.0001:
+                last_ok_t1 = t1_cand
+                last_ok_t2 = t2_cand
+                last_ok_r = r
 
             # Emulate Coloc2 SimpleStepper update() and termination criteria.
             last_r, current_r = current_r, r
@@ -1973,13 +2141,19 @@ class ColocalizationApp:
             if np.isfinite(min_r_seen) and np.isfinite(r) and (r - min_r_seen) > min_r_excess:
                 stop_reasons.append("r_above_min_r")
             finished = bool(stop_reasons)
+
             if finished:
+                # Always return the last threshold where r was still >= 0.0001.
+                t1_opt = last_ok_t1
+                t2_opt = last_ok_t2
                 _emit(
                     "STOP "
                     f"idx={step_idx} reasons={','.join(stop_reasons)} "
-                    f"final_t1={t1_cand:.6g} final_t2={t2_cand:.6g} final_r={r:.8g} "
+                    f"final_t1={t1_opt:.6g} final_t2={t2_opt:.6g} "
+                    f"last_ok_r={last_ok_r:.8g} current_r={r:.8g} "
                     f"min_r={min_r_seen:.8g} next_work_t={next_work_t:.6g}"
                 )
+
             work_t = next_work_t
             step_idx += 1
 
