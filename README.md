@@ -120,7 +120,12 @@ The built-in synthetic generator includes presets:
 | Randomization control | Mostly independent channels; shuffled r ≈ observed r |
 
 Demo sets can also be exported as uint16 TIFF files via "Export Demo TIFFs".
-
+## venv setup
+cd to the app folder and create a virtual environment with a python >=3.12:
+```bash
+cd pycoloc-x.x.x
+python3.12 -m venv ./
+```
 ## Dependencies
 
 Install required packages:

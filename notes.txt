@@ -80,3 +80,106 @@ In real data, the two channels almost never have matched means and variances —
 This is actually an underappreciated source of variability in published colocalization results. **The convention in Coloc 2 is to always put the dimmer or sparser channel as channel 1** (red), which tends to give a more stable regression, but this is a convention, not a mathematical fix.
 
 The asymmetry is a real limitation of the Costes method — it is one of the motivations for methods that use orthogonal regression (minimizing perpendicular residuals) rather than ordinary least squares, which would be fully symmetric by construction.
+-----------------------------------------------
+
+
+I’ll break down each patch as an exact before/after behavior change and tie it to the Coloc2 mechanism it mirrors, with precise file locations.**Exact Patch Breakdown (Coloc2 Pairing Changes)**
+
+1. Regression mode default changed  
+Location: colocalization_app.py
+
+- Before: orthogonal regression checkbox defaulted to False.
+- After: default is True.
+- Effect: analysis now starts in orthogonal/TLS mode unless you disable it. This changes fitted slope/intercept and therefore paired thresholds.
+
+2. Costes method description updated to Coloc2-style semantics  
+Location: colocalization_app.py
+
+- Before docs described:
+  - threshold scan from Ch1 max to min,
+  - background mask with AND,
+  - stop at first r ≤ 0 with foreground support constraint.
+- After docs describe:
+  - 1-intensity stepper logic,
+  - step axis chosen by slope magnitude,
+  - background mask with OR,
+  - Coloc2-like stop criteria (tiny r, NaN, or r rebound).
+
+3. Removed fixed linspace candidate sweep  
+Location: colocalization_app.py
+
+- Before: built candidates with linspace(max1, min1, n_steps+1).
+- After: no linspace sweep; iterative stepper decreases by 1 each iteration.
+- Effect: search path now matches Coloc2 SimpleStepper behavior.
+
+4. Added channel-dependent stepping axis  
+Location: colocalization_app.py
+
+- Before: always scanned T1 and derived T2 from regression line.
+- After:
+  - if -1 < slope < 1, step on Ch1;
+  - otherwise step on Ch2 and derive paired Ch1 threshold by inverse mapping.
+- Effect: reproduces Coloc2 strategy for steep regressions.
+
+5. Threshold rounding changed to integer-level image thresholds  
+Location: colocalization_app.py
+
+- Before: thresholds were floating candidates from linspace mapping.
+- After: thresholds rounded with floor(x + 0.5), then clipped to image min/max.
+- Effect: candidate thresholds align to integer intensity bins as in Coloc2.
+
+6. Background mask changed from AND to OR  
+Location: colocalization_app.py
+
+- Before: background pixels were c1 < T1 AND c2 < T2.
+- After: background pixels are c1 < T1 OR c2 < T2.
+- Effect: this is the major behavioral change; background set is larger and typically changes r-vs-threshold trajectory significantly.
+
+7. Minimal pixel validity and finite-r handling changed  
+Location: colocalization_app.py
+
+- Before: skipped candidates with too few pixels/zero std and continued loop.
+- After: computes r only if mask has at least 3 pixels and both std are valid, else sets r = NaN.
+- Effect: integrates invalid states into stop logic instead of silently skipping.
+
+8. Removed foreground support guardrails  
+Location: previous logic around old min_fg_pixels block replaced in colocalization_app.py
+
+- Before: required minimum foreground support and per-channel support; used these guards to accept/stop.
+- After: those constraints are removed.
+- Effect: threshold can be accepted even when surviving foreground is small, matching Coloc2 closer but less conservative.
+
+9. Stop condition replaced with Coloc2-like termination  
+Location: colocalization_app.py
+
+- Before: stop when r ≤ 0 under support constraints.
+- After stop when any is true:
+  - r non-finite,
+  - next threshold < 1,
+  - r < 1e-4,
+  - r > last_r (rebound).
+- Effect: emulates Coloc2 stepper stopping rather than first zero-crossing logic.
+
+10. Fallback policy changed  
+Location: colocalization_app.py
+
+- Before: tracked best supported candidate; fallback to global minimum-r candidate when needed.
+- After: keeps current stepper output unless all r are non-finite; then fallback to conservative defaults.
+- Effect: aligns with stepper-driven output model.
+
+11. Minor signature/variable cleanup  
+Location: colocalization_app.py
+
+- n_steps remains in signature but is no longer used by the new stepper loop.
+- max2/min2 handling expanded for clipping both thresholds.
+- Effect: compatibility retained, behavior shifted to stepper model.
+
+**Summary of what changed mathematically**
+
+- Regression line source changed by default (orthogonal on).
+- Threshold traversal changed (unit-step, slope-dependent axis).
+- Background definition changed (OR instead of AND).
+- Stop rule changed (stepper criteria vs first r ≤ 0).
+- Conservative robustness guards were removed.
+
+These are exactly the reasons you can see equal-looking thresholds but different biological-looking output patterns in M1/M2/tM1/tM2.
