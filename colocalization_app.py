@@ -153,6 +153,7 @@ class ColocalizationApp:
         self._orthreg_var = tk.BooleanVar(value=True)
         self._costes_debug_log_var = tk.BooleanVar(value=False)
         self._costes_stop_pct_var = tk.StringVar(value="1.0")
+        self._run_button_text = "Run Costes + Analyze"
 
         self._build_ui()
         self.root.after(0, self._ensure_window_visible)
@@ -370,10 +371,11 @@ class ColocalizationApp:
         btn_save_roi_mask.grid(row=1, column=5, padx=3, pady=2)
         self._attach_tooltip(btn_save_roi_mask, "Save the current ROI as a binary mask image")
 
-        btn_run = ttk.Button(outer, text="Run Costes + Analyze", command=self.run_analysis, width=18)
+        btn_run = ttk.Button(outer, text=self._run_button_text, command=self.run_analysis, width=18)
         btn_run.configure(style="Analyze.TButton")
         btn_run.grid(row=1, column=6, padx=3, pady=2)
         self._attach_tooltip(btn_run, "Compute thresholds and colocalization metrics")
+        self._btn_run = btn_run
 
         # Row 2
         cb_despike = ttk.Checkbutton(
@@ -467,7 +469,7 @@ class ColocalizationApp:
         self._attach_tooltip(btn_quit, "Close the application")
 
         ttk.Separator(outer, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=5, sticky=tk.EW, pady=(4, 3))
-        ttk.Label(outer, textvariable=self._status, foreground=GRAY).grid(
+        ttk.Label(outer, textvariable=self._status, foreground=FG).grid(
             row=5, column=0, columnspan=5, sticky=tk.W, padx=2, pady=(0, 2)
         )
 
@@ -613,9 +615,21 @@ class ColocalizationApp:
         )
         style.map(
             "Analyze.TButton",
-            background=[("active", "#3f965c")],
-            foreground=[("active", "#ffffff")],
+            background=[("disabled", "#4b5b53"), ("active", "#3f965c")],
+            foreground=[("disabled", "#d5ddd6"), ("active", "#ffffff")],
         )
+
+    def _set_run_button_busy(self, busy: bool):
+        """Shade and disable the Run button while analysis is executing."""
+        if not hasattr(self, "_btn_run"):
+            return
+        if busy:
+            self._btn_run.state(["disabled"])
+            self._btn_run.configure(text="Running...")
+        else:
+            self._btn_run.state(["!disabled"])
+            self._btn_run.configure(text=self._run_button_text)
+        self.root.update_idletasks()
 
     def _build_image_panel(self, parent):
         fig, axes = plt.subplots(1, 2, figsize=(7, 4), facecolor=BG2)
@@ -2378,6 +2392,7 @@ class ColocalizationApp:
     # ── analysis entry point ───────────────────────────────────────────────────
 
     def run_analysis(self):
+        self._set_run_button_busy(True)
         use_preprocess = self._despike_var.get()
 
         if self._roi_kind in {"lasso", "mask"}:
@@ -2387,12 +2402,14 @@ class ColocalizationApp:
         else:
             c1_img, c2_img = self._get_roi_arrays(preprocess=use_preprocess)
             if c1_img is None:
+                self._set_run_button_busy(False)
                 messagebox.showwarning("Missing data", "Load both channel images first.")
                 return
             c1 = c1_img.ravel()
             c2 = c2_img.ravel()
 
         if c1 is None:
+            self._set_run_button_busy(False)
             messagebox.showwarning("Missing data", "Load both channel images first.")
             return
 
@@ -2482,6 +2499,7 @@ class ColocalizationApp:
                 else ""
             )
         )
+        self._set_run_button_busy(False)
 
     def _slider_update(self, _=None, draw_plots: bool = True):
         try:
