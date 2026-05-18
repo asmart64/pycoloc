@@ -465,6 +465,7 @@ class ColocalizationApp:
         self._attach_tooltip(btn_pdf, "Export current plots and metrics to PDF")
 
         btn_quit = ttk.Button(outer, text="Quit", command=self._on_close, width=10)
+        btn_quit.configure(style="Danger.TButton")
         btn_quit.grid(row=3, column=4, padx=3, pady=2)
         self._attach_tooltip(btn_quit, "Close the application")
 
@@ -619,6 +620,20 @@ class ColocalizationApp:
             foreground=[("disabled", "#d5ddd6"), ("active", "#ffffff")],
         )
 
+        # Destructive action style for Quit.
+        style.configure(
+            "Danger.TButton",
+            background="#a61e2a",
+            foreground="#fff3f3",
+            padding=5,
+            font=("TkDefaultFont", 9, "bold"),
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#c52d3b")],
+            foreground=[("active", "#ffffff")],
+        )
+
     def _set_run_button_busy(self, busy: bool):
         """Shade and disable the Run button while analysis is executing."""
         if not hasattr(self, "_btn_run"):
@@ -688,8 +703,14 @@ class ColocalizationApp:
             )
 
     def _build_right_panel(self, parent):
+        # Reserve space for bottom manual inputs first so they stay visible
+        # even on smaller laptop displays.
+        sf = ttk.LabelFrame(parent, text="Manual Threshold Input")
+        sf.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=4)
+        self._build_sliders(sf)
+
         nb = ttk.Notebook(parent)
-        nb.pack(fill=tk.BOTH, expand=True)
+        nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # Tab 1 – Intensity Histograms
         t_hist = ttk.Frame(nb)
@@ -718,10 +739,7 @@ class ColocalizationApp:
         nb.add(t_res, text="Results")
         self._build_results_tab(t_res)
 
-        # Manual threshold controls (entry-only for responsiveness)
-        sf = ttk.LabelFrame(parent, text="Manual Threshold Input")
-        sf.pack(fill=tk.X, padx=4, pady=4)
-        self._build_sliders(sf)
+        # Manual threshold controls are packed above to keep them pinned at bottom.
 
     def _build_results_tab(self, parent):
         outer = ttk.Frame(parent, padding=14)
